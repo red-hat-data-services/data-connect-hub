@@ -5,11 +5,15 @@ use arrow_flight::flight_service_server::FlightServiceServer;
 use clap::Parser;
 use config::{Config, File};
 use flight_service::flight::TabularDataService;
-use flight_service::flight::auth::AuthInterceptor;
+use flight_service::flight::auth::AuthLayer;
+use flight_service::flight::metrics::{install_prometheus_recorder, spawn_metrics_server};
 use flight_service::flight::registry::ConnectorsRegistry;
+use kube_utils::KubeAuthClient;
 use kube_utils::secrets::KubeSecretStore;
+use milvus_connector::MilvusConnector;
 use pg_meta_store::store::PgMetaStore;
 use postgres_connector::PgConnector;
+use s3_connector::S3Connector;
 use sqlite_connector::SqliteConnector;
 use std::sync::Arc;
 use std::time::Duration;
@@ -50,7 +54,6 @@ pub async fn shutdown_signal() {
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
 
-    // Wait until either Ctrl+C (SIGINT) or SIGTERM is received
     tokio::select! {
         _ = ctrl_c => println!("\nReceived Ctrl+C, shutting down gracefully..."),
         _ = terminate => println!("\nReceived SIGTERM, shutting down gracefully..."),
@@ -67,8 +70,106 @@ fn load_config(config_file: String, secret_config_file: String) -> Result<Server
     Ok(config)
 }
 
+fn build_connectors_registry(config: &ServerConfig) -> ConnectorsRegistry {
+    ConnectorsRegistry::new()
+        .with_connector(Arc::new(PgConnector::new(
+            Duration::from_secs(config.ingestion_cache_pools.ttl_secs),
+            Duration::from_secs(config.ingestion_cache_pools.idle_secs),
+            config.ingestion_cache_pools.max_capacity,
+        )))
+        .with_connector(Arc::new(SqliteConnector::new()))
+        .with_connector(Arc::new(S3Connector::new(
+            Duration::from_secs(config.ingestion_cache_pools.ttl_secs),
+            Duration::from_secs(config.ingestion_cache_pools.idle_secs),
+            config.ingestion_cache_pools.max_capacity,
+        )))
+        .with_connector(Arc::new(MilvusConnector::new(
+            Duration::from_secs(config.ingestion_cache_pools.ttl_secs),
+            Duration::from_secs(config.ingestion_cache_pools.idle_secs),
+            config.ingestion_cache_pools.max_capacity,
+        )))
+}
+
+async fn configure_tls(
+    mut builder: tonic::transport::Server,
+    tls: &utils::TlsConfig,
+) -> Result<tonic::transport::Server> {
+    tls.validate().map_err(|e| anyhow::anyhow!(e))?;
+    if let (Some(cert_file), Some(key_file)) = (&tls.cert_file, &tls.key_file) {
+        let cert = tokio::fs::read(cert_file).await?;
+        let key = tokio::fs::read(key_file).await?;
+        let identity = tonic::transport::Identity::from_pem(cert, key);
+        let tls_config = tonic::transport::ServerTlsConfig::new().identity(identity);
+        builder = builder.tls_config(tls_config)?;
+        tracing::info!("TLS enabled (cert: {}, key: {})", cert_file, key_file);
+    } else {
+        tracing::warn!("TLS is DISABLED — gRPC traffic is unencrypted");
+    }
+    Ok(builder)
+}
+
+fn configure_metrics(config: &ServerConfig) -> Result<()> {
+    if config.metrics.enabled {
+        tracing::info!(
+            "Prometheus metrics enabled on {}:{}",
+            config.metrics.address,
+            config.metrics.port
+        );
+        install_prometheus_recorder()?;
+        spawn_metrics_server(config.metrics.address.clone(), config.metrics.port);
+    } else {
+        tracing::info!("Prometheus metrics disabled");
+    }
+    Ok(())
+}
+
+async fn start_server(
+    mut builder: tonic::transport::Server,
+    auth: &utils::AuthConfig,
+    service: FlightServiceServer<TabularDataService>,
+    addr: std::net::SocketAddr,
+) -> Result<()> {
+    let (health_reporter, health_service) = tonic_health::server::health_reporter();
+    health_reporter
+        .set_serving::<FlightServiceServer<TabularDataService>>()
+        .await;
+
+    if auth.enabled {
+        tracing::info!(
+            "Auth enabled (cache TTL: {}s, token_review_audiences: {:?})",
+            auth.cache_ttl_secs,
+            auth.token_review_audiences
+        );
+        let kube_auth = KubeAuthClient::try_default(
+            Duration::from_secs(auth.cache_ttl_secs),
+            auth.token_review_audiences.clone(),
+        )
+        .await?;
+        let auth_layer = AuthLayer::new(Arc::new(kube_auth));
+        builder
+            .layer(auth_layer)
+            .add_service(health_service)
+            .add_service(service)
+            .serve_with_shutdown(addr, shutdown_signal())
+            .await?;
+    } else {
+        tracing::warn!("Auth is DISABLED — all requests are unauthenticated");
+        builder
+            .add_service(health_service)
+            .add_service(service)
+            .serve_with_shutdown(addr, shutdown_signal())
+            .await?;
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("Failed to install rustls CryptoProvider");
+
     let args = CommandLineArgs::parse();
     let config = load_config(args.config, args.secret_config)?;
     config.query.validate().map_err(|e| anyhow::anyhow!(e))?;
@@ -76,43 +177,29 @@ async fn main() -> Result<()> {
 
     tracing::info!("Starting DataConnectorHub Flight service");
 
-    let connectors_registry = ConnectorsRegistry::new()
-        .with_connector(Arc::new(PgConnector::new(
-            Duration::from_secs(config.ingestion_cache_pools.ttl_secs),
-            Duration::from_secs(config.ingestion_cache_pools.idle_secs),
-            config.ingestion_cache_pools.max_capacity,
-        )))
-        .with_connector(Arc::new(SqliteConnector::new()));
+    let addr: std::net::SocketAddr = format!("{}:{}", config.server.address, config.server.port).parse()?;
+    let builder = tonic::transport::Server::builder();
+    let builder = configure_tls(builder, &config.tls).await?;
+    configure_metrics(&config)?;
 
-    let secret_store = KubeSecretStore::try_default(Duration::from_secs(300)).await?;
-
+    let connectors_registry = Arc::new(build_connectors_registry(&config));
+    let secret_store = Arc::new(KubeSecretStore::try_default(Duration::from_secs(300)).await?);
     let query_options = commons::api::tabular::QueryOptions {
         batch_size: config.query.batch_size,
     };
 
-    let addr = format!("{}:{}", config.server.address, config.server.port).parse()?;
-    let service = TabularDataService::new(
-        Arc::new(connectors_registry),
-        Arc::new(PgMetaStore::new(config.database).await?),
-        Arc::new(secret_store),
+    let tenant_id = config.global_connection_types.tenant_id.clone();
+    let auth = config.auth;
+    let meta_store = Arc::new(PgMetaStore::new(config.database, tenant_id).await?);
+
+    let service = FlightServiceServer::new(TabularDataService::new(
+        connectors_registry,
+        meta_store,
+        secret_store,
         query_options,
-    );
+    ));
 
-    let auth_interceptor = AuthInterceptor::new();
-    let service = FlightServiceServer::with_interceptor(service, auth_interceptor);
-
-    let (health_reporter, health_service) = tonic_health::server::health_reporter();
-    health_reporter
-        .set_serving::<FlightServiceServer<TabularDataService>>()
-        .await;
-
-    tonic::transport::Server::builder()
-        .add_service(health_service)
-        .add_service(service)
-        .serve_with_shutdown(addr, shutdown_signal())
-        .await?;
-
+    start_server(builder, &auth, service, addr).await?;
     tracing::info!("DataConnectorHub Flight service stopped");
-
     Ok(())
 }

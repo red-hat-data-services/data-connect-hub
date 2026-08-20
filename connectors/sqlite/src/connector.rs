@@ -3,13 +3,14 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use commons::api::connections::{Admin, DataConnectionResource};
+
 use commons::api::errors::ConnectorError;
 use commons::api::tabular::{QueryOptions, TabularState};
 use commons::api::tabular::{QueryOutput, TabularReader};
 
 use futures::StreamExt;
 
+use commons::api::connections::{Admin, DataConnectionResource};
 use commons::api::tabular::FlightConnector;
 use moka::future::Cache;
 use sqlx::sqlite::SqliteRow;
@@ -39,12 +40,16 @@ impl FlightConnector for SqliteConnector {
         "sqlite".to_string()
     }
 
+    fn description(&self) -> String {
+        "SQLite connector".to_string()
+    }
+
     async fn get_reader(
         &self,
         data_connection: &DataConnectionResource,
     ) -> Result<Arc<dyn TabularReader>, ConnectorError> {
         let credentials = match &data_connection.resource.admin {
-            Some(Admin::Secret { secret }) => Some(secret.clone()),
+            Some(Admin::Secret { name: _, secret }) => Some(secret.clone()),
             _ => None,
         }
         .ok_or_else(|| ConnectorError::ConnectionError("SQLite credentials are required".to_string()))?;
@@ -127,6 +132,10 @@ impl TabularReader for SqliteReader {
 
         Ok(Box::pin(stream))
     }
+
+    async fn test_connection(&self) -> Result<(), ConnectorError> {
+        Ok(())
+    }
 }
 
 fn rows_to_batch(schema: &Arc<Schema>, rows: &[SqliteRow]) -> Result<RecordBatch, ConnectorError> {
@@ -136,7 +145,7 @@ fn rows_to_batch(schema: &Arc<Schema>, rows: &[SqliteRow]) -> Result<RecordBatch
             let col = &columns[col_idx];
             build_array(col.type_info().name(), rows, col_idx)
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
 
     RecordBatch::try_new(Arc::clone(schema), arrays).map_err(|e| ConnectorError::SQLError(e.to_string()))
 }
@@ -151,28 +160,49 @@ fn sqlite_type_to_arrow(sqlite_type: &str) -> DataType {
     }
 }
 
-fn build_array(sqlite_type: &str, rows: &[SqliteRow], col_idx: usize) -> ArrayRef {
+fn build_array(sqlite_type: &str, rows: &[SqliteRow], col_idx: usize) -> Result<ArrayRef, ConnectorError> {
+    let err = |e: sqlx::Error| ConnectorError::SQLError(e.to_string());
     match sqlite_type {
         "BOOLEAN" => {
-            let vals: Vec<Option<bool>> = rows.iter().map(|r| r.get(col_idx)).collect();
-            Arc::new(BooleanArray::from(vals))
+            let vals: Vec<Option<bool>> = rows
+                .iter()
+                .map(|r| r.try_get(col_idx))
+                .collect::<Result<_, _>>()
+                .map_err(err)?;
+            Ok(Arc::new(BooleanArray::from(vals)))
         },
         "INTEGER" => {
-            let vals: Vec<Option<i64>> = rows.iter().map(|r| r.get(col_idx)).collect();
-            Arc::new(Int64Array::from(vals))
+            let vals: Vec<Option<i64>> = rows
+                .iter()
+                .map(|r| r.try_get(col_idx))
+                .collect::<Result<_, _>>()
+                .map_err(err)?;
+            Ok(Arc::new(Int64Array::from(vals)))
         },
         "REAL" => {
-            let vals: Vec<Option<f64>> = rows.iter().map(|r| r.get(col_idx)).collect();
-            Arc::new(Float64Array::from(vals))
+            let vals: Vec<Option<f64>> = rows
+                .iter()
+                .map(|r| r.try_get(col_idx))
+                .collect::<Result<_, _>>()
+                .map_err(err)?;
+            Ok(Arc::new(Float64Array::from(vals)))
         },
         "BLOB" => {
-            let vals: Vec<Option<Vec<u8>>> = rows.iter().map(|r| r.get(col_idx)).collect();
+            let vals: Vec<Option<Vec<u8>>> = rows
+                .iter()
+                .map(|r| r.try_get(col_idx))
+                .collect::<Result<_, _>>()
+                .map_err(err)?;
             let vals: Vec<Option<&[u8]>> = vals.iter().map(|v| v.as_deref()).collect();
-            Arc::new(BinaryArray::from(vals))
+            Ok(Arc::new(BinaryArray::from(vals)))
         },
         _ => {
-            let vals: Vec<Option<String>> = rows.iter().map(|r| r.get(col_idx)).collect();
-            Arc::new(StringArray::from(vals))
+            let vals: Vec<Option<String>> = rows
+                .iter()
+                .map(|r| r.try_get(col_idx))
+                .collect::<Result<_, _>>()
+                .map_err(err)?;
+            Ok(Arc::new(StringArray::from(vals)))
         },
     }
 }

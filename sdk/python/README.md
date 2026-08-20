@@ -7,26 +7,49 @@ Python client library for the [Data Connect Hub](https://github.com/opendatahub-
 > **Note:** This package is not yet published to PyPI. Install from source for now.
 
 ```bash
-# From the repository root
-pip install -e "sdk/python[dev]"
+# REST only (default)
+pip install sdk/python
+
+# REST + Flight SQL
+pip install "sdk/python[flight]"
 ```
 
 ## Quick Start
 
 ```python
-from data_connect_hub import DataConnectClient
+from data_connect_hub import AdminSecretRef, DataConnectClient
 
 client = DataConnectClient(
     rest_url="https://dch.example.com",
-    token="<your-token>",  # raw token value, "Bearer" prefix added automatically
+    flight_url="grpc://dch.example.com:50051",
+    token="<your-token>",  # or use token_provider= for auto-refresh
     tenant_id="my-tenant",
 )
 
-# List connections
+# Or use a token provider for automatic refresh on 401:
+client = DataConnectClient(
+    rest_url="https://dch.example.com",
+    token_provider=lambda: get_fresh_token(),  # your function; called once, cached, refreshed on 401
+    tenant_id="my-tenant",
+)
+
+# List connections (REST)
 connections = client.list_connections()
 
 # Get a specific connection
 conn = client.get_connection("conn-id")
+
+# Create a connection
+conn = client.create_connection(
+    name="my-db",
+    connection_type_id="dct-a1b2c3d4",
+    data_format="tabular",  # DataFormat: "tabular" | "binary"
+    admin=AdminSecretRef(secret_ref="secret/my-db"),
+)
+
+# Query data via Flight SQL
+table = client.read("SELECT * FROM prompts", connection_id="conn-uuid")
+df = table.to_pandas()
 ```
 
 ## API Reference
@@ -36,8 +59,8 @@ conn = client.get_connection("conn-id")
 ```python
 client.list_connections() -> list[DataConnection]
 client.get_connection(connection_id) -> DataConnection
-client.create_connection(name=..., namespace=..., provider=..., data_format=..., location_url=...) -> DataConnection
-client.update_connection(connection_id, name=...) -> DataConnection
+client.create_connection(name=..., connection_type_id=..., data_format=..., admin=..., properties=...) -> DataConnection
+client.update_connection(connection_id, name=..., connection_type_id=..., data_format=..., admin=...) -> DataConnection
 client.delete_connection(connection_id) -> None
 ```
 
@@ -46,15 +69,17 @@ client.delete_connection(connection_id) -> None
 ```python
 client.list_connection_types() -> list[ConnectionType]
 client.get_connection_type(type_id) -> ConnectionType
-client.create_connection_type(name=..., description=...) -> ConnectionType
-client.update_connection_type(type_id, name=...) -> ConnectionType
+client.create_connection_type(name=..., provider=..., description=..., credentials_fields=...) -> ConnectionType
+client.update_connection_type(type_id, name=..., provider=..., description=..., credentials_fields=...) -> ConnectionType
 client.delete_connection_type(type_id) -> None
 ```
 
-### Unstructured Data Ingestion (REST)
+### Tabular Data Queries (Flight SQL)
 
 ```python
-await client.ingest(connection_id) -> bytes  # async
+client.read(sql, connection_id) -> pyarrow.Table       # full result as Arrow Table
+client.read_pandas(sql, connection_id) -> pd.DataFrame # full result as pandas DataFrame
+client.server_info() -> dict                           # server metadata
 ```
 
 ## Development
@@ -74,4 +99,5 @@ make sdk-all         # lint + typecheck + test
 ## Requirements
 
 - Python 3.11+
-- Dependencies: httpx, pydantic
+- Core dependencies: httpx, pydantic
+- Flight SQL extras: adbc-driver-flightsql, pyarrow, pandas (`pip install "data-connect-hub[flight]"`)

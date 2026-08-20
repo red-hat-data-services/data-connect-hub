@@ -19,6 +19,7 @@ package main
 import (
 	"crypto/tls"
 	"flag"
+	"fmt"
 	"os"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
@@ -37,7 +38,7 @@ import (
 
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
-	dataconnecthubv1alpha1 "github.com/opendatahub-io/data-connect-hub/dc-controller/api/v1alpha1"
+	dchv1alpha1 "github.com/opendatahub-io/data-connect-hub/dc-controller/api/dataconnecthub/v1alpha1"
 	"github.com/opendatahub-io/data-connect-hub/dc-controller/internal/controller"
 	// +kubebuilder:scaffold:imports
 )
@@ -47,10 +48,19 @@ var (
 	setupLog = ctrl.Log.WithName("setup")
 )
 
+func requiredEnv(key string) string {
+	v := os.Getenv(key)
+	if v == "" {
+		setupLog.Error(fmt.Errorf("required environment variable %s is not set", key), "")
+		os.Exit(1)
+	}
+	return v
+}
+
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 
-	utilruntime.Must(dataconnecthubv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(dchv1alpha1.AddToScheme(scheme))
 	utilruntime.Must(gatewayv1.Install(scheme))
 	// +kubebuilder:scaffold:scheme
 }
@@ -184,26 +194,51 @@ func main() {
 		os.Exit(1)
 	}
 
-	namespace := os.Getenv("APPLICATIONS_NAMESPACE")
-	if namespace == "" {
-		namespace = "opendatahub"
+	if err := (&controller.DataConnectServiceReconciler{
+		Client:             mgr.GetClient(),
+		Scheme:             mgr.GetScheme(),
+		ManifestsPath:      manifestsPath,
+		RestImage:          requiredEnv("RELATED_IMAGE_ODH_DATA_CONNECT_HUB_REST_IMAGE"),
+		FlightImage:        requiredEnv("RELATED_IMAGE_ODH_DATA_CONNECT_HUB_FLIGHT_IMAGE"),
+		KubeRbacProxyImage: requiredEnv("RELATED_IMAGE_ODH_KUBE_RBAC_PROXY_IMAGE"),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "dataconnectservice")
+		os.Exit(1)
 	}
 
-	if err := (&controller.DataConnectHubReconciler{
-		Client:        mgr.GetClient(),
-		Scheme:        mgr.GetScheme(),
-		ManifestsPath: manifestsPath,
-		Namespace:     namespace,
-		RestImage: controller.EnvOrDefault(
-			controller.EnvRestImage,
-			"ghcr.io/opendatahub-io/data-connect-hub/rest-service:latest",
-		),
-		FlightImage: controller.EnvOrDefault(
-			controller.EnvFlightImage,
-			"ghcr.io/opendatahub-io/data-connect-hub/flight-service:latest",
-		),
+	restURLResolver := controller.NewRestServiceURLResolver(mgr.GetClient())
+
+	if err := (&controller.InitDataConnectionTypeReconciler{
+		Client:     mgr.GetClient(),
+		Scheme:     mgr.GetScheme(),
+		RestClient: controller.NewHTTPConnectionTypeClient(restURLResolver),
 	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "Failed to create controller", "controller", "dataconnecthub")
+		setupLog.Error(err, "Failed to create controller", "controller", "initdataconnectiontype")
+		os.Exit(1)
+	}
+	if err := (&controller.InitDataConnectionReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "initdataconnection")
+		os.Exit(1)
+	}
+
+	if err := (&controller.ConfigMapWatcherReconciler{
+		Client:     mgr.GetClient(),
+		Scheme:     mgr.GetScheme(),
+		RestClient: controller.NewHTTPConnectionTypeClient(restURLResolver),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "configmapwatcher")
+		os.Exit(1)
+	}
+
+	if err := (&controller.SecretWatcherReconciler{
+		Client:     mgr.GetClient(),
+		Scheme:     mgr.GetScheme(),
+		RestClient: controller.NewHTTPMigrationClient(restURLResolver),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "secretwatcher")
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder

@@ -1,5 +1,6 @@
 use actix_web::web::{JsonConfig, PathConfig, QueryConfig};
 use actix_web::{HttpResponse, ResponseError, http::StatusCode};
+use commons::api::errors::SecretStoreError;
 use commons::api::errors::{ConnectorError, MetaStoreError};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -23,6 +24,19 @@ pub enum EndpointError {
     InvalidHeaderValue(String),
     #[error("Unimplemented")]
     Unimplemented,
+}
+
+#[allow(unused)]
+#[derive(Error, Debug)]
+pub enum ValidationError {
+    #[error("Invalid tenant ID")]
+    InvalidTenantId,
+    #[error("Invalid data connection type")]
+    InvalidDataConnectionType,
+    #[error("Invalid secret")]
+    InvalidSecret,
+    #[error("Missing required key: {0}")]
+    MissingRequiredKey(String),
 }
 
 impl fmt::Display for RestErrorResponse {
@@ -49,10 +63,18 @@ impl From<ConnectorError> for RestErrorResponse {
             ConnectorError::ConfigError(_) => ("config", 500),
             ConnectorError::ConnectionError(_) => ("connection", 503),
             ConnectorError::SQLError(_) => ("sql_error", 400),
+            ConnectorError::IOError(_) => ("io_error", 500),
+        };
+        let message = match &err {
+            ConnectorError::IOError(_) => {
+                tracing::error!("{err}");
+                "data source I/O error".to_string()
+            },
+            _ => err.to_string(),
         };
         RestErrorResponse {
             code: code.to_string(),
-            message: err.to_string(),
+            message,
             status,
         }
     }
@@ -65,10 +87,28 @@ impl From<MetaStoreError> for RestErrorResponse {
             MetaStoreError::InvalidRequest(_) => ("invalid_request", 400),
             MetaStoreError::Config(_) => ("config", 500),
             MetaStoreError::Connection(_) => ("connection", 503),
-            MetaStoreError::Query(_) => ("query_error", 400),
+            MetaStoreError::Query(_) => ("query_error", 500),
+            MetaStoreError::Conflict(_) => ("conflict", 409),
             MetaStoreError::Serialization(_) => ("serialization", 400),
             MetaStoreError::Deserialization(_) => ("deserialization", 400),
             MetaStoreError::Validation(_) => ("validation", 400),
+        };
+        RestErrorResponse {
+            code: code.to_string(),
+            message: err.to_string(),
+            status,
+        }
+    }
+}
+
+impl From<SecretStoreError> for RestErrorResponse {
+    fn from(err: SecretStoreError) -> Self {
+        let (code, status) = match &err {
+            SecretStoreError::SecretNotFound(_) => ("secret_not_found", 404),
+            SecretStoreError::Forbidden(_) => ("forbidden", 403),
+            SecretStoreError::CannotCreateSecret(_) => ("cannot_create_secret", 400),
+            SecretStoreError::CannotDeleteSecret(_) => ("cannot_delete_secret", 400),
+            SecretStoreError::CannotSetSecretLabels(_) => ("cannot_set_secret_labels", 400),
         };
         RestErrorResponse {
             code: code.to_string(),

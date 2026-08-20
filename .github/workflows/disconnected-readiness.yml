@@ -1,0 +1,13 @@
+name: Disconnected Readiness
+on:
+  pull_request:
+    branches:
+      - main
+      - master
+
+jobs:
+  check:
+    # TODO: revert to @v1 once scorer cuts a release including our exceptions
+    uses: opendatahub-io/disconnected-readiness-scorer/.github/workflows/disconnected-readiness-check.yml@main
+    with:
+      rules: ""

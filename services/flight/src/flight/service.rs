@@ -1,7 +1,8 @@
 use crate::flight::errors::{map_connector_error, map_meta_store_error, map_secret_store_error};
+use crate::flight::metrics;
 use crate::flight::registry::ConnectorsRegistry;
 use arrow_flight::{
-    FlightDescriptor, FlightEndpoint, FlightInfo, Ticket,
+    Action, ActionType, FlightDescriptor, FlightEndpoint, FlightInfo, Ticket,
     encode::FlightDataEncoderBuilder,
     error::FlightError,
     flight_service_server::FlightService,
@@ -10,15 +11,48 @@ use arrow_flight::{
         metadata::SqlInfoDataBuilder, server::FlightSqlService,
     },
 };
-use commons::api::connections::{Admin, DataConnectionResource, SecretStore};
+use commons::api::connections::{Admin, DataConnectionResource};
+use commons::api::storage::{MetaStore, SecretStore};
 use commons::api::tabular::QueryOptions;
-use commons::api::{X_DATA_CONNECTION_ID, X_TENANT_ID, connections::MetaStore};
+use commons::api::{X_DATA_CONNECTION_ID, X_TENANT_ID};
 use futures::TryStreamExt;
 use prost::Message;
 use prost::bytes::Bytes;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Instant;
 use tonic::{Request, Response, Status};
 use tracing::{debug, info};
+
+const METHOD_GET_FLIGHT_INFO: &str = "arrow.flight.protocol.FlightService/GetFlightInfo";
+const METHOD_DO_GET: &str = "arrow.flight.protocol.FlightService/DoGet";
+const OPERATION_SQL_INFO: &str = "sql_info";
+const OPERATION_STATEMENT: &str = "statement";
+const STATUS_OK: &str = "OK";
+
+const ACTION_GET_SUPPORTED_CONNECTORS: &str = "GetSupportedConnectors";
+
+fn grpc_status_label(status: &Status) -> &'static str {
+    match status.code() {
+        tonic::Code::Ok => "OK",
+        tonic::Code::Cancelled => "Cancelled",
+        tonic::Code::Unknown => "Unknown",
+        tonic::Code::InvalidArgument => "InvalidArgument",
+        tonic::Code::DeadlineExceeded => "DeadlineExceeded",
+        tonic::Code::NotFound => "NotFound",
+        tonic::Code::AlreadyExists => "AlreadyExists",
+        tonic::Code::PermissionDenied => "PermissionDenied",
+        tonic::Code::ResourceExhausted => "ResourceExhausted",
+        tonic::Code::FailedPrecondition => "FailedPrecondition",
+        tonic::Code::Aborted => "Aborted",
+        tonic::Code::OutOfRange => "OutOfRange",
+        tonic::Code::Unimplemented => "Unimplemented",
+        tonic::Code::Internal => "Internal",
+        tonic::Code::Unavailable => "Unavailable",
+        tonic::Code::DataLoss => "DataLoss",
+        tonic::Code::Unauthenticated => "Unauthenticated",
+    }
+}
 
 pub struct TabularDataService {
     connectors_registry: Arc<ConnectorsRegistry>,
@@ -26,6 +60,12 @@ pub struct TabularDataService {
     secret_store: Arc<dyn SecretStore + Send + Sync>,
     sql_info: arrow_flight::sql::metadata::SqlInfoData,
     query_options: QueryOptions,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ConnectorInfo {
+    name: String,
+    description: String,
 }
 
 impl TabularDataService {
@@ -84,26 +124,20 @@ impl TabularDataService {
                 .await
                 .map_err(map_secret_store_error)?;
             r.resource.admin = Some(Admin::Secret {
-                secret: Arc::new(secret.properties),
+                name: secret.name.clone(),
+                secret: secret.properties.clone(),
             });
         }
+
         Ok(r)
     }
-}
 
-#[tonic::async_trait]
-impl FlightSqlService for TabularDataService {
-    type FlightService = TabularDataService;
-
-    async fn register_sql_info(&self, _id: i32, _result: &SqlInfo) {}
-
-    async fn get_flight_info_sql_info(
+    fn handle_get_flight_info_sql_info(
         &self,
         query: CommandGetSqlInfo,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
         let requested: Vec<String> = Self::query_to_string(&query);
-
         info!("get_flight_info_sql_info: {:?}", requested);
 
         let flight_descriptor = request.into_inner();
@@ -119,13 +153,11 @@ impl FlightSqlService for TabularDataService {
         Ok(Response::new(flight_info))
     }
 
-    async fn do_get_sql_info(
+    fn handle_do_get_sql_info(
         &self,
         query: CommandGetSqlInfo,
-        _request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         let requested: Vec<String> = Self::query_to_string(&query);
-
         info!("do_get_sql_info: {:?}", requested);
 
         let batch = query
@@ -144,7 +176,7 @@ impl FlightSqlService for TabularDataService {
         ))
     }
 
-    async fn get_flight_info_statement(
+    async fn handle_get_flight_info_statement(
         &self,
         query: CommandStatementQuery,
         request: Request<FlightDescriptor>,
@@ -202,7 +234,7 @@ impl FlightSqlService for TabularDataService {
         Ok(Response::new(flight_info))
     }
 
-    async fn do_get_statement(
+    async fn handle_do_get_statement(
         &self,
         ticket: TicketStatementQuery,
         request: Request<Ticket>,
@@ -258,5 +290,105 @@ impl FlightSqlService for TabularDataService {
         Ok(Response::new(
             Box::pin(flight_stream) as <Self as FlightService>::DoGetStream
         ))
+    }
+}
+
+#[tonic::async_trait]
+impl FlightSqlService for TabularDataService {
+    type FlightService = TabularDataService;
+
+    async fn register_sql_info(&self, _id: i32, _result: &SqlInfo) {}
+
+    async fn list_custom_actions(&self) -> Option<Vec<Result<ActionType, Status>>> {
+        Some(vec![Ok(ActionType {
+            r#type: ACTION_GET_SUPPORTED_CONNECTORS.into(),
+            description: "Returns the list of supported data connectors".into(),
+        })])
+    }
+
+    async fn do_action_fallback(
+        &self,
+        request: Request<Action>,
+    ) -> Result<Response<<Self as FlightService>::DoActionStream>, Status> {
+        let action = request.get_ref();
+        match action.r#type.as_str() {
+            ACTION_GET_SUPPORTED_CONNECTORS => {
+                let providers = self
+                    .connectors_registry
+                    .get_supported_connectors()
+                    .iter()
+                    .map(|p| ConnectorInfo {
+                        name: p.provider(),
+                        description: p.description(),
+                    })
+                    .collect::<Vec<ConnectorInfo>>();
+                let body = serde_json::to_vec(&providers).map_err(|e| Status::internal(e.to_string()))?;
+                let result = arrow_flight::Result { body: body.into() };
+                Ok(Response::new(
+                    Box::pin(futures::stream::once(async { Ok(result) })) as <Self as FlightService>::DoActionStream
+                ))
+            },
+            _ => Err(Status::invalid_argument(format!("Unknown action: {}", action.r#type))),
+        }
+    }
+
+    async fn get_flight_info_sql_info(
+        &self,
+        query: CommandGetSqlInfo,
+        request: Request<FlightDescriptor>,
+    ) -> Result<Response<FlightInfo>, Status> {
+        let started = Instant::now();
+        let result = self.handle_get_flight_info_sql_info(query, request);
+        let status = match &result {
+            Ok(_) => STATUS_OK,
+            Err(e) => grpc_status_label(e),
+        };
+        metrics::observe_rpc(METHOD_GET_FLIGHT_INFO, OPERATION_SQL_INFO, status, started.elapsed());
+        result
+    }
+
+    async fn do_get_sql_info(
+        &self,
+        query: CommandGetSqlInfo,
+        _request: Request<Ticket>,
+    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        let started = Instant::now();
+        let result = self.handle_do_get_sql_info(query);
+        let status = match &result {
+            Ok(_) => STATUS_OK,
+            Err(e) => grpc_status_label(e),
+        };
+        metrics::observe_rpc(METHOD_DO_GET, OPERATION_SQL_INFO, status, started.elapsed());
+        result
+    }
+
+    async fn get_flight_info_statement(
+        &self,
+        query: CommandStatementQuery,
+        request: Request<FlightDescriptor>,
+    ) -> Result<Response<FlightInfo>, Status> {
+        let started = Instant::now();
+        let result = self.handle_get_flight_info_statement(query, request).await;
+        let status = match &result {
+            Ok(_) => STATUS_OK,
+            Err(e) => grpc_status_label(e),
+        };
+        metrics::observe_rpc(METHOD_GET_FLIGHT_INFO, OPERATION_STATEMENT, status, started.elapsed());
+        result
+    }
+
+    async fn do_get_statement(
+        &self,
+        ticket: TicketStatementQuery,
+        request: Request<Ticket>,
+    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        let started = Instant::now();
+        let result = self.handle_do_get_statement(ticket, request).await;
+        let status = match &result {
+            Ok(_) => STATUS_OK,
+            Err(e) => grpc_status_label(e),
+        };
+        metrics::observe_rpc(METHOD_DO_GET, OPERATION_STATEMENT, status, started.elapsed());
+        result
     }
 }

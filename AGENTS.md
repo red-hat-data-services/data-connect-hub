@@ -132,8 +132,8 @@ make container-rest     # rest-service image
 make container-all      # both service images
 ```
 
-The dc-controller has a separate `Dockerfile` and
-is built from its own Makefile:
+The dc-controller has its own `Containerfile.konflux`
+and is built from its own Makefile:
 
 ```console
 cd dc-controller && make docker-build
@@ -149,11 +149,6 @@ Workflows under `.github/workflows/`:
   `Swatinem/rust-cache` for dependency caching.
 - **`python-sdk.yml`** — runs on PRs touching `sdk/python/`.
   Lint, typecheck, and unit tests for the Python SDK.
-- **`container-publish.yml`** — runs on push to `main`
-  and version tags (`v*.*.*`). Builds multi-arch
-  container images and pushes to `ghcr.io`. Images are
-  tagged with the short commit SHA and either `latest`
-  (main) or the version tag.
 - **`ci-dco-signoff.yml`** — runs on PRs. Verifies all
   commits have a `Signed-off-by:` trailer (DCO). Use
   `git commit -s` to sign off.
@@ -174,10 +169,10 @@ make check-dco   # run DCO check locally
   The ODH team is actively migrating modules to **Helm v2 charts** (FeastOperator, OGX, Kserve, odh-observability
   all use Helm). We should plan to convert our `dc-controller/config/` overlays to a Helm chart in a future release.
   Reference PRs: opendatahub-operator#3813 (OGX/Helm), #3654 (MLflow/Kustomize migration).
-- The Module CRD uses API group `components.platform.opendatahub.io` (ODH standard for all module CRDs).
-- The Module CR is cluster-scoped and singleton (`default-dataconnecthub`).
+- The DataConnectService CRD uses API group `dataconnecthub.opendatahub.io`.
+- The CR is cluster-scoped and singleton (`default-dataconnectservice`).
 - Status follows the PlatformObject contract: `observedGeneration`, `distribution`, `releases`,
   and conditions `Ready`, `ProvisioningSucceeded`, `Degraded`.
 - Application images are resolved from env vars for disconnected/air-gapped support:
-  `RELATED_IMAGE_ODH_DCH_REST_SERVICE` (rest-service) and
-  `RELATED_IMAGE_ODH_DCH_FLIGHT_SERVICE` (flight-service).
+  `RELATED_IMAGE_ODH_DATA_CONNECT_HUB_REST_IMAGE` (rest-service) and
+  `RELATED_IMAGE_ODH_DATA_CONNECT_HUB_FLIGHT_IMAGE` (flight-service).

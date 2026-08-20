@@ -13,26 +13,30 @@ Quick start:
 ```console
 cd dc-controller
 
-helm install dc-controller chart/ \
+helm install dc-controller charts/ \
   --namespace dc-controller-system --create-namespace
 ```
 
 ## Custom Resource
 
-The `DataConnectHub` CR is cluster-scoped and singleton (must be named
-`default-dataconnecthub`). Helm creates it automatically. A minimal spec:
+The `DataConnectService` CR is namespace-scoped. After installing the
+operator, create the CR in the namespace where you want the services deployed:
 
 ```yaml
-apiVersion: components.platform.opendatahub.io/v1alpha1
-kind: DataConnectHub
+apiVersion: dataconnecthub.opendatahub.io/v1alpha1
+kind: DataConnectService
 metadata:
-  name: default-dataconnecthub
-spec: {}
+  name: default-dataconnectservice
+  namespace: opendatahub
+spec:
+  restService: {}
+  flightService: {}
 ```
 
-`devMode` defaults to `true` (deploys a built-in Postgres). Set
-`devMode: false` and provide `database.externalSecret` for an external
-database.
+The controller requires a `dch-database-config` Secret in the same
+namespace as the CR. Provision PostgreSQL (e.g., via CloudNativePG on
+OpenShift or an external service) and create the secret before creating
+the CR. See [deploy.md](../docs/user-guide/deploy.md) for full instructions.
 
 ### Status
 

@@ -1,5 +1,11 @@
+use commons::api::connection_types::Secret;
+use commons::api::connections::Admin;
+use commons::api::connections::DataConnection;
+use commons::utils::config::GlobalConnectionTypes;
 use pg_meta_store::store::DatabaseConfig;
 use serde::Deserialize;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Debug, Deserialize)]
 pub struct Server {
@@ -10,8 +16,35 @@ pub struct Server {
 #[derive(Debug, Deserialize)]
 pub struct ServerConfig {
     pub server: Server,
-    #[serde(rename = "database")]
-    pub _database: DatabaseConfig,
+    pub database: DatabaseConfig,
+    #[serde(rename = "global-connection-types")]
+    pub global_connection_types: GlobalConnectionTypes,
+}
+
+pub async fn transform_data_connection(
+    tenant_id: &str,
+    data_connection: &DataConnection,
+) -> (DataConnection, Option<Secret>) {
+    let mut data_connection = data_connection.clone();
+
+    match &data_connection.admin {
+        Some(Admin::Secret { name, secret }) => {
+            let properties = secret.clone();
+
+            let secret_obj = Secret {
+                name: name.to_string(),
+                namespace: tenant_id.to_string(),
+                properties: properties.clone(),
+                labels: Arc::new(HashMap::new()),
+                annotations: Arc::new(HashMap::new()),
+            };
+            data_connection.admin = Some(Admin::SecretRef {
+                secret_ref: name.to_string(),
+            });
+            (data_connection, Some(secret_obj))
+        },
+        _ => (data_connection, None),
+    }
 }
 
 #[cfg(test)]
@@ -23,12 +56,15 @@ mod tests {
     #[test]
     fn test_server_config_deserialize() {
         let toml_str = r#"
+            [database]
+            url = "postgresql://user-a@localhost:5432/db-a"
+            
             [server]
             address = "127.0.0.1"
             port = 8080
 
-            [database]
-            url = "postgresql://user:pass@localhost:5432/testdb"
+            [global-connection-types]
+            tenant-id = "opendatahub"
         "#;
 
         let config = Config::builder()
@@ -39,10 +75,6 @@ mod tests {
         let server_config: ServerConfig = config.try_deserialize().unwrap();
         assert_eq!(server_config.server.address, "127.0.0.1");
         assert_eq!(server_config.server.port, 8080);
-        assert_eq!(
-            server_config._database.url,
-            "postgresql://user:pass@localhost:5432/testdb"
-        );
     }
 
     #[test]

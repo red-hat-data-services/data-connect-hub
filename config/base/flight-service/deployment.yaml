@@ -45,6 +45,8 @@ spec:
           ports:
             - name: grpc
               containerPort: 50051
+            - name: metrics
+              containerPort: 9090
           env:
             - name: RUST_LOG
               value: info
@@ -54,14 +56,17 @@ spec:
             - name: db-secret
               mountPath: /secrets
               readOnly: true
+            - name: tls
+              mountPath: /etc/tls/private
+              readOnly: true
           readinessProbe:
-            grpc:
-              port: 50051
+            tcpSocket:
+              port: grpc
             initialDelaySeconds: 3
             periodSeconds: 10
           livenessProbe:
-            grpc:
-              port: 50051
+            tcpSocket:
+              port: grpc
             initialDelaySeconds: 5
             periodSeconds: 15
       volumes:
@@ -70,7 +75,10 @@ spec:
             name: flight-service-config
         - name: db-secret
           secret:
-            secretName: postgres-credentials
+            secretName: dch-database-config
             items:
               - key: secret-config.toml
                 path: secret-config.toml
+        - name: tls
+          secret:
+            secretName: flight-service-tls

@@ -8,13 +8,21 @@ rules:
   - ""
   resources:
   - configmaps
-  - persistentvolumeclaims
-  - secrets
   - serviceaccounts
   - services
   verbs:
   - create
   - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
   - get
   - list
   - patch
@@ -33,9 +41,36 @@ rules:
   - update
   - watch
 - apiGroups:
-  - components.platform.opendatahub.io
+  - authentication.k8s.io
   resources:
-  - dataconnecthubs
+  - tokenreviews
+  verbs:
+  - create
+- apiGroups:
+  - authorization.k8s.io
+  resources:
+  - subjectaccessreviews
+  verbs:
+  - create
+- apiGroups:
+  - dataconnecthub.opendatahub.io
+  resources:
+  - data-connection-types
+  - data-connections
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - post
+  - put
+  - update
+  - watch
+- apiGroups:
+  - dataconnecthub.opendatahub.io
+  resources:
+  - dataconnectservices
   verbs:
   - create
   - delete
@@ -45,19 +80,30 @@ rules:
   - update
   - watch
 - apiGroups:
-  - components.platform.opendatahub.io
+  - dataconnecthub.opendatahub.io
   resources:
-  - dataconnecthubs/finalizers
+  - dataconnectservices/finalizers
   verbs:
   - update
 - apiGroups:
-  - components.platform.opendatahub.io
+  - dataconnecthub.opendatahub.io
   resources:
-  - dataconnecthubs/status
+  - dataconnectservices/status
+  - initdataconnections/status
+  - initdataconnectiontypes/status
   verbs:
   - get
   - patch
   - update
+- apiGroups:
+  - dataconnecthub.opendatahub.io
+  resources:
+  - initdataconnections
+  - initdataconnectiontypes
+  verbs:
+  - get
+  - list
+  - watch
 - apiGroups:
   - gateway.networking.k8s.io
   resources:
@@ -82,6 +128,19 @@ rules:
   - networking.k8s.io
   resources:
   - networkpolicies
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - rbac.authorization.k8s.io
+  resources:
+  - clusterrolebindings
+  - clusterroles
   verbs:
   - create
   - delete

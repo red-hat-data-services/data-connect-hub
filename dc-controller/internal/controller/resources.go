@@ -18,19 +18,19 @@ package controller
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	apimachtypes "k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -40,7 +40,7 @@ import (
 	"sigs.k8s.io/kustomize/kyaml/resid"
 	sigyaml "sigs.k8s.io/yaml"
 
-	dataconnecthubv1alpha1 "github.com/opendatahub-io/data-connect-hub/dc-controller/api/v1alpha1"
+	dchv1alpha1 "github.com/opendatahub-io/data-connect-hub/dc-controller/api/dataconnecthub/v1alpha1"
 )
 
 // --- Kustomize rendering ---
@@ -60,24 +60,6 @@ func renderKustomization(diskPath string, patches []kustypes.Patch, images []kus
 		if err := patchKustomization(memFS, absPath, patches, images); err != nil {
 			return nil, fmt.Errorf("patching kustomization: %w", err)
 		}
-	}
-
-	return runKrusty(memFS, absPath)
-}
-
-func renderPostgresKustomization(diskPath string) ([]*unstructured.Unstructured, error) {
-	absPath, err := filepath.Abs(diskPath)
-	if err != nil {
-		return nil, fmt.Errorf("resolving path %s: %w", diskPath, err)
-	}
-
-	memFS := filesys.MakeFsInMemory()
-	if err := copyDirToMemFS(absPath, memFS); err != nil {
-		return nil, fmt.Errorf("copying postgres manifests to memory: %w", err)
-	}
-
-	if err := stripSecretGenerator(memFS, absPath); err != nil {
-		return nil, fmt.Errorf("stripping secret generator: %w", err)
 	}
 
 	return runKrusty(memFS, absPath)
@@ -171,31 +153,9 @@ func patchKustomization(fs filesys.FileSystem, dir string, patches []kustypes.Pa
 	return fs.WriteFile(kustPath, out)
 }
 
-func stripSecretGenerator(fs filesys.FileSystem, dir string) error {
-	kustPath := filepath.Join(dir, "kustomization.yaml")
-	data, err := fs.ReadFile(kustPath)
-	if err != nil {
-		return fmt.Errorf("reading kustomization: %w", err)
-	}
-
-	var kust map[string]any
-	if err := sigyaml.Unmarshal(data, &kust); err != nil {
-		return fmt.Errorf("parsing kustomization: %w", err)
-	}
-
-	delete(kust, "secretGenerator")
-	delete(kust, "generatorOptions")
-
-	out, err := sigyaml.Marshal(kust)
-	if err != nil {
-		return fmt.Errorf("serializing kustomization: %w", err)
-	}
-	return fs.WriteFile(kustPath, out)
-}
-
 // --- CR overrides → kustomize patches ---
 
-func buildServicePatches(name string, overrides *dataconnecthubv1alpha1.ServiceOverrides) []kustypes.Patch {
+func buildServicePatches(name string, overrides *dchv1alpha1.ServiceOverrides) []kustypes.Patch {
 	if overrides == nil {
 		return nil
 	}
@@ -278,7 +238,7 @@ func buildServicePatches(name string, overrides *dataconnecthubv1alpha1.ServiceO
 		patches = append(patches, kustypes.Patch{
 			Target: &kustypes.Selector{
 				ResId: resid.ResId{
-					Gvk:  resid.Gvk{Group: "apps", Version: "v1", Kind: "Deployment"},
+					Gvk:  resid.Gvk{Group: "apps", Version: "v1", Kind: kindDeployment},
 					Name: name,
 				},
 			},
@@ -289,7 +249,7 @@ func buildServicePatches(name string, overrides *dataconnecthubv1alpha1.ServiceO
 	return patches
 }
 
-func resolveServiceImage(name string, overrides *dataconnecthubv1alpha1.ServiceOverrides, restImage, flightImage string) string {
+func resolveServiceImage(name string, overrides *dchv1alpha1.ServiceOverrides, restImage, flightImage string) string {
 	if overrides != nil && overrides.Image != nil {
 		return *overrides.Image
 	}
@@ -301,7 +261,7 @@ func resolveServiceImage(name string, overrides *dataconnecthubv1alpha1.ServiceO
 
 func setDeploymentImage(resources []*unstructured.Unstructured, containerName, image string) {
 	for _, obj := range resources {
-		if obj.GetKind() != "Deployment" {
+		if obj.GetKind() != kindDeployment {
 			continue
 		}
 		containers, found, _ := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", "containers")
@@ -309,7 +269,7 @@ func setDeploymentImage(resources []*unstructured.Unstructured, containerName, i
 			continue
 		}
 		for i, c := range containers {
-			container, ok := c.(map[string]interface{})
+			container, ok := c.(map[string]any)
 			if !ok {
 				continue
 			}
@@ -322,7 +282,27 @@ func setDeploymentImage(resources []*unstructured.Unstructured, containerName, i
 	}
 }
 
-func buildGatewayPatches(gw *dataconnecthubv1alpha1.Gateway) []kustypes.Patch {
+func setConfigMapGlobalNamespace(resources []*unstructured.Unstructured, namespace string) {
+	for _, obj := range resources {
+		if obj.GetKind() != kindConfigMap {
+			continue
+		}
+		data, found, _ := unstructured.NestedStringMap(obj.Object, "data")
+		if !found {
+			continue
+		}
+		toml, ok := data["config.toml"]
+		if !ok || !strings.Contains(toml, "tenant-id") {
+			continue
+		}
+		data["config.toml"] = strings.ReplaceAll(toml,
+			`tenant-id = "opendatahub"`,
+			fmt.Sprintf(`tenant-id = "%s"`, namespace))
+		_ = unstructured.SetNestedStringMap(obj.Object, data, "data")
+	}
+}
+
+func buildGatewayPatches(gw *dchv1alpha1.Gateway) []kustypes.Patch {
 	if gw == nil {
 		return nil
 	}
@@ -345,21 +325,48 @@ spec:
 
 // --- Apply resources with SSA and owner references ---
 
-func (r *DataConnectHubReconciler) applyResources(
+// resourcePriority returns a sort key that ensures infrastructure resources
+// (ServiceAccount, ConfigMap, …) are applied before workloads (Deployment).
+// On OpenShift the SA's dockercfg pull-secret is generated asynchronously;
+// creating the Deployment first produces pods without imagePullSecrets.
+func resourcePriority(kind string) int {
+	switch kind {
+	case "ServiceAccount":
+		return 0
+	case "ConfigMap", "Secret", "Service", "NetworkPolicy",
+		"ClusterRole", "ClusterRoleBinding", "Role", "RoleBinding":
+		return 1
+	case kindDeployment, "StatefulSet", "DaemonSet", "Job":
+		return 2
+	default:
+		return 3
+	}
+}
+
+func (r *DataConnectServiceReconciler) applyResources(
 	ctx context.Context,
-	cr *dataconnecthubv1alpha1.DataConnectHub,
+	cr *dchv1alpha1.DataConnectService,
+	namespace string,
 	resources []*unstructured.Unstructured,
 ) error {
 	log := logf.FromContext(ctx)
 
+	slices.SortStableFunc(resources, func(a, b *unstructured.Unstructured) int {
+		return resourcePriority(a.GetKind()) - resourcePriority(b.GetKind())
+	})
+
 	for _, obj := range resources {
-		obj.SetNamespace(r.Namespace)
+		obj.SetNamespace(namespace)
+
+		if obj.GetKind() == "ClusterRoleBinding" {
+			patchClusterRoleBindingSubjects(obj, namespace)
+		}
 
 		labels := obj.GetLabels()
 		if labels == nil {
 			labels = map[string]string{}
 		}
-		labels["components.platform.opendatahub.io/managed-by"] = "dataconnecthub"
+		labels["dataconnecthub.opendatahub.io/managed-by"] = "dataconnectservice"
 		obj.SetLabels(labels)
 
 		if err := controllerutil.SetControllerReference(cr, obj, r.Scheme); err != nil {
@@ -392,16 +399,12 @@ func (r *DataConnectHubReconciler) applyResources(
 			return fmt.Errorf("getting %s %s: %w", obj.GetKind(), obj.GetName(), err)
 		}
 
-		if obj.GetKind() == "PersistentVolumeClaim" {
-			continue
-		}
-
 		existingHash := ""
 		if existingAnn := existing.GetAnnotations(); existingAnn != nil {
 			existingHash = existingAnn["dataconnecthub/spec-hash"]
 		}
 		if existingHash == desiredHash {
-			if existing.GetOwnerReferences() == nil || len(existing.GetOwnerReferences()) == 0 {
+			if !hasControllerOwner(existing, cr.GetUID()) {
 				if err := controllerutil.SetControllerReference(cr, existing, r.Scheme); err == nil {
 					if updateErr := r.Update(ctx, existing); updateErr != nil {
 						return fmt.Errorf("repairing owner ref on %s %s: %w", obj.GetKind(), obj.GetName(), updateErr)
@@ -422,6 +425,15 @@ func (r *DataConnectHubReconciler) applyResources(
 	return nil
 }
 
+func hasControllerOwner(obj *unstructured.Unstructured, uid apimachtypes.UID) bool {
+	for _, ref := range obj.GetOwnerReferences() {
+		if ref.UID == uid && ref.Controller != nil && *ref.Controller {
+			return true
+		}
+	}
+	return false
+}
+
 func specHash(obj *unstructured.Unstructured) string {
 	content := obj.DeepCopy().UnstructuredContent()
 	delete(content, "status")
@@ -439,64 +451,43 @@ func specHash(obj *unstructured.Unstructured) string {
 	return hex.EncodeToString(h[:])[:16]
 }
 
-// --- Postgres secret (programmatic — random password generation) ---
+// --- Database secret validation ---
 
-func (r *DataConnectHubReconciler) reconcilePostgresSecret(ctx context.Context, cr *dataconnecthubv1alpha1.DataConnectHub) error {
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      namePostgresCreds,
-			Namespace: r.Namespace,
-		},
+func (r *DataConnectServiceReconciler) validateDatabaseSecret(ctx context.Context, namespace string) error {
+	secret := &corev1.Secret{}
+	key := client.ObjectKey{Name: nameDatabaseConfig, Namespace: namespace}
+	if err := r.Get(ctx, key, secret); err != nil {
+		if apierrors.IsNotFound(err) {
+			return fmt.Errorf("secret %q not found in namespace %q — create it with keys DATABASE_URL and secret-config.toml", nameDatabaseConfig, namespace)
+		}
+		return fmt.Errorf("reading secret %s: %w", nameDatabaseConfig, err)
 	}
 
-	mutateFn := func() error {
-		if secret.Labels == nil {
-			secret.Labels = map[string]string{}
+	for _, k := range []string{"DATABASE_URL", "secret-config.toml"} {
+		value, ok := secret.Data[k]
+		if !ok || strings.TrimSpace(string(value)) == "" {
+			return fmt.Errorf("secret %q is missing or has empty required key %q", nameDatabaseConfig, k)
 		}
-		secret.Labels["app.kubernetes.io/name"] = namePostgres
-		secret.Labels["app.kubernetes.io/part-of"] = nameDataConnectHub
-
-		requiredKeys := []string{"POSTGRESQL_USER", "POSTGRESQL_PASSWORD", "POSTGRESQL_DATABASE", "secret-config.toml"}
-		hasAllKeys := len(secret.Data) >= len(requiredKeys)
-		for _, k := range requiredKeys {
-			if _, ok := secret.Data[k]; !ok {
-				hasAllKeys = false
-				break
-			}
-		}
-		if !hasAllKeys {
-			password := generatePassword(24)
-			dbUser := "dch"
-			dbName := "dataconnecthub"
-			connURL := fmt.Sprintf("postgresql://%s:%s@postgres:5432/%s", dbUser, password, dbName)
-
-			secret.StringData = map[string]string{
-				"POSTGRESQL_USER":     dbUser,
-				"POSTGRESQL_PASSWORD": password,
-				"POSTGRESQL_DATABASE": dbName,
-			}
-			secret.Data = map[string][]byte{
-				"secret-config.toml": fmt.Appendf(nil, "[database]\nurl = \"%s\"\n", connURL),
-			}
-		}
-
-		return controllerutil.SetControllerReference(cr, secret, r.Scheme)
 	}
-
-	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, secret, mutateFn)
-	if apierrors.IsAlreadyExists(err) {
-		// Cache was stale — retry now that the informer has caught up
-		_, err = controllerutil.CreateOrUpdate(ctx, r.Client, secret, mutateFn)
-	}
-	return err
+	return nil
 }
 
-// --- Helpers ---
-
-func generatePassword(length int) string {
-	b := make([]byte, length)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)[:length]
+func patchClusterRoleBindingSubjects(obj *unstructured.Unstructured, namespace string) {
+	subjects, found, _ := unstructured.NestedSlice(obj.Object, "subjects")
+	if !found {
+		return
+	}
+	for i, s := range subjects {
+		sub, ok := s.(map[string]any)
+		if !ok {
+			continue
+		}
+		if kind, _ := sub["kind"].(string); kind == "ServiceAccount" {
+			sub["namespace"] = namespace
+			subjects[i] = sub
+		}
+	}
+	_ = unstructured.SetNestedSlice(obj.Object, subjects, "subjects")
 }
 
 func indent(s string, spaces int) string {
