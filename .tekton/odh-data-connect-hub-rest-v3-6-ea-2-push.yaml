@@ -39,7 +39,7 @@ spec:
   - name: hermetic
     value: "true"
   - name: prefetch-input
-    value: '{"type": "cargo", "path": "."}'
+    value: '[{"type": "cargo", "path": "."},{"type": "rpm", "path": "."}]'
   - name: build-source-image
     value: true
   - name: enable-cache-proxy
