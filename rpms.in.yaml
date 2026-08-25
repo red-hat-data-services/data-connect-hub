@@ -1,0 +1,17 @@
+arches:
+  - x86_64
+  - aarch64
+  - ppc64le
+  - s390x
+contentOrigin:
+  repofiles:
+    - ubi.repo
+packages:
+  - gcc
+  - gcc-c++
+  - pkgconf
+  - make
+  - perl
+  - cargo
+context:
+  containerfile: services/flight/Containerfile.konflux

@@ -1,4 +1,7 @@
-FROM docker.io/library/rust:1.96.0 AS builder
+FROM registry.access.redhat.com/ubi9/ubi-minimal:9.7@sha256:d91be7cea9f03a757d69ad7fcdfcd7849dba820110e7980d5e2a1f46ed06ea3b AS builder
+
+RUN microdnf install -y gcc gcc-c++ pkgconf make perl cargo \
+    && microdnf clean all
 
 WORKDIR /src
 
