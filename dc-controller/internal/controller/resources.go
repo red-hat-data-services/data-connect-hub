@@ -252,6 +252,10 @@ func flightServiceResourceName(crName string) string {
 	return crName + "-flight"
 }
 
+func httpRouteResourceName(crName string) string {
+	return crName + "-route"
+}
+
 func renderFlightService(resources []*unstructured.Unstructured, crName string) []*unstructured.Unstructured {
 	serviceName := flightServiceResourceName(crName)
 	for _, obj := range resources {
@@ -260,7 +264,7 @@ func renderFlightService(resources []*unstructured.Unstructured, crName string) 
 			continue
 		}
 		if obj.GetKind() == "HTTPRoute" {
-			obj.SetName(crName + "-route")
+			obj.SetName(httpRouteResourceName(crName))
 			obj.Object = replaceStringValue(obj.UnstructuredContent(), nameFlightService, serviceName).(map[string]any)
 		}
 	}
@@ -407,6 +411,20 @@ func setConfigMapFlightConnectorSettings(resources []*unstructured.Unstructured,
 					return fmt.Errorf("connector %s connectionTimeout must be a positive whole number of seconds", connector.Name)
 				}
 				section["connection_timeout_secs"] = int64(duration / time.Second)
+			}
+			if connector.RequestTimeout != nil {
+				duration := connector.RequestTimeout.Duration
+				if duration <= 0 || duration%time.Second != 0 {
+					return fmt.Errorf("connector %s requestTimeout must be a positive whole number of seconds", connector.Name)
+				}
+				section["request_timeout_secs"] = int64(duration / time.Second)
+			}
+			if connector.ReadTimeout != nil {
+				duration := connector.ReadTimeout.Duration
+				if duration <= 0 || duration%time.Second != 0 {
+					return fmt.Errorf("connector %s readTimeout must be a positive whole number of seconds", connector.Name)
+				}
+				section["read_timeout_secs"] = int64(duration / time.Second)
 			}
 		}
 
