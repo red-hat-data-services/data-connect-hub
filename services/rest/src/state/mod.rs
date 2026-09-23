@@ -13,6 +13,7 @@ pub(crate) struct ApiService {
     pub secret_store: Arc<dyn SecretStore + Send + Sync>,
     pub flight_ca_cert: Option<Vec<u8>>,
     pub service_account_token_file: Option<String>,
+    pub global_tenant_id: String,
 }
 
 impl ApiService {
@@ -21,12 +22,14 @@ impl ApiService {
         secret_store: Arc<dyn SecretStore + Send + Sync>,
         flight_ca_cert: Option<Vec<u8>>,
         service_account_token_file: Option<String>,
+        global_tenant_id: String,
     ) -> Self {
         Self {
             meta_store,
             secret_store,
             flight_ca_cert,
             service_account_token_file,
+            global_tenant_id,
         }
     }
 

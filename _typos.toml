@@ -4,3 +4,7 @@ extend-exclude = [
     "dc-controller/charts/crds/",
     "docs/api/*.html",
 ]
+
+[default.extend-words]
+# Allow "ba" in hex trace IDs (W3C Trace Context standard uses example ID with "ba")
+ba = "ba"

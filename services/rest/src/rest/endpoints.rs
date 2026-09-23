@@ -312,7 +312,7 @@ pub async fn create_flight_service(
 
     let connectors = service
         .flight_client(&flight.internal_url)
-        .get_supported_connectors()
+        .get_supported_connectors(&service.global_tenant_id)
         .await?;
 
     let connectors_names = connectors.iter().map(|c| c.name.clone()).collect::<Vec<_>>();
@@ -526,7 +526,7 @@ mod tests {
     use super::*;
     use crate::rest::API_VERSION;
     use crate::rest::errors::{json_config, query_config};
-    use crate::rest::middleware::validate_headers;
+    use crate::rest::middleware::{trace_request, validate_headers};
 
     fn api_path(path: &str) -> String {
         format!("/api/{API_VERSION}/data{path}")
@@ -984,6 +984,7 @@ mod tests {
             Arc::new(StubSecretStore::new()),
             None,
             None,
+            "test-tenant".to_string(),
         ))
     }
 
@@ -991,6 +992,7 @@ mod tests {
         cfg.service(
             web::scope(&format!("/api/{API_VERSION}/data"))
                 .wrap(middleware::from_fn(validate_headers))
+                .wrap(middleware::from_fn(trace_request))
                 .route("/connections", web::get().to(list_connections))
                 .route("/connections", web::post().to(create_connection))
                 .route("/connections/{id}", web::get().to(get_connection))
