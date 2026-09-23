@@ -453,7 +453,7 @@ mod tests {
         meta: Arc<dyn MetaStore + Send + Sync>,
         secrets: Arc<dyn SecretStore + Send + Sync>,
     ) -> ApiService {
-        ApiService::new(meta, secrets, None, None)
+        ApiService::new(meta, secrets, None, None, "test-tenant".to_string())
     }
 
     #[tokio::test]

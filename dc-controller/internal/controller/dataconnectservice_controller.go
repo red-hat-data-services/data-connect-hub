@@ -69,12 +69,21 @@ const (
 	nameFlightService  = "flight-service"
 	nameDataConnectHub = "data-connect-hub"
 	nameDatabaseConfig = "dch-database-config"
+	nameKubeRbacProxy  = "kube-rbac-proxy"
+
+	// OTLP exporter environment variables carrying spec.trace to the service containers.
+	envOTLPEndpoint    = "OTEL_EXPORTER_OTLP_ENDPOINT"
+	envOTLPInsecure    = "OTEL_EXPORTER_OTLP_INSECURE"
+	envOTLPCertificate = "OTEL_EXPORTER_OTLP_CERTIFICATE"
 
 	kindDeployment         = "Deployment"
 	kindConfigMap          = "ConfigMap"
 	kindService            = "Service"
 	kindServiceAccount     = "ServiceAccount"
 	kindClusterRoleBinding = "ClusterRoleBinding"
+
+	valueTrue  = "true"
+	valueFalse = "false"
 
 	repoURL = "https://github.com/opendatahub-io/data-connect-hub"
 
@@ -382,21 +391,24 @@ func (r *DataConnectServiceReconciler) reconcileManifests(
 	}
 
 	setDeploymentImage(resources, nameRestService, r.RestImage)
-	setDeploymentImage(resources, "kube-rbac-proxy", r.KubeRbacProxyImage)
+	setDeploymentImage(resources, nameKubeRbacProxy, r.KubeRbacProxyImage)
 
 	resources = renderFlightService(resources, cr.Name)
+	flightContainerName := flightServiceResourceName(cr.Name)
 
-	setDeploymentImage(resources, flightServiceResourceName(cr.Name), r.FlightImage)
-
-	flightName := flightServiceResourceName(cr.Name)
+	setDeploymentImage(resources, flightContainerName, r.FlightImage)
 
 	setConfigMapGlobalNamespace(resources, cr.Namespace)
-	setConfigMapDiscoveryServiceAccount(resources, cr.Namespace, flightName)
-	setConfigMapFlightServiceAddress(resources, cr.Namespace, flightName)
+	setConfigMapDiscoveryServiceAccount(resources, cr.Namespace, flightContainerName)
+	setConfigMapFlightServiceAddress(resources, cr.Namespace, flightContainerName)
 	if cr.Spec.FlightService != nil {
-		if err := setConfigMapFlightConnectorSettings(resources, flightName, &cr.Spec.FlightService.ServiceOverrides); err != nil {
+		if err := setConfigMapFlightConnectorSettings(resources, flightContainerName, &cr.Spec.FlightService.ServiceOverrides); err != nil {
 			return fmt.Errorf("setting flight-service connector configuration: %w", err)
 		}
+	}
+
+	if !reconcileTraceEnv(resources, cr.Spec.Trace, nameRestService, flightContainerName) {
+		logf.FromContext(ctx).V(1).Info("trace reconciliation: no service container found in rendered manifests")
 	}
 
 	audiences := r.resolveTokenReviewAudiences(cr, platCfg)
@@ -407,7 +419,7 @@ func (r *DataConnectServiceReconciler) reconcileManifests(
 		setKubeRbacProxyAudiences(resources, audiences)
 	}
 
-	annotateFlightDeploymentsWithConfigHash(resources, flightName)
+	annotateFlightDeploymentsWithConfigHash(resources, flightContainerName)
 
 	return r.applyResources(ctx, cr, cr.Namespace, resources)
 }
@@ -742,7 +754,7 @@ func (r *DataConnectServiceReconciler) http2Enabled(ctx context.Context) (enable
 	})
 	if err := r.Get(ctx, types.NamespacedName{Name: "cluster"}, clusterIngress); err == nil {
 		known = true
-		if clusterIngress.GetAnnotations()[http2EnableAnnotation] == "true" {
+		if clusterIngress.GetAnnotations()[http2EnableAnnotation] == valueTrue {
 			return true, true
 		}
 	}

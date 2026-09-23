@@ -104,6 +104,13 @@ impl FlightConnector for MilvusConnector {
         "Milvus vector database connector".to_string()
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(
+        connector.provider = PROVIDER,
+        connection.id = %data_connection.metadata.id,
+        )
+    )]
     async fn get_reader(
         &self,
         data_connection: &DataConnectionResource,
@@ -167,6 +174,7 @@ impl DataReader for MilvusReader {
         PROVIDER.to_string()
     }
 
+    #[tracing::instrument(skip_all, fields(connector.provider = PROVIDER))]
     async fn schema(&self, query: &str) -> Result<Arc<Query>, ConnectorError> {
         let request = MilvusRequestInput::parse(query)?;
         let field_descs = self.describe_collection(&request.collection_name).await?;
@@ -175,6 +183,7 @@ impl DataReader for MilvusReader {
         Ok(Arc::new(Query::new(query.to_owned(), Arc::new(schema))))
     }
 
+    #[tracing::instrument(skip_all, fields(connector.provider = PROVIDER, batch_size = options.batch_size))]
     async fn read_tabular(&self, query: Arc<Query>, options: &QueryOptions) -> QueryOutput {
         let request = MilvusRequestInput::parse(&query.query)?;
         let schema = query.schema.clone();
@@ -201,6 +210,7 @@ impl DataReader for MilvusReader {
         }
     }
 
+    #[tracing::instrument(skip_all, fields(connector.provider = PROVIDER))]
     async fn check_connection(&self) -> Result<(), ConnectorError> {
         self.client
             .execute("/v2/vectordb/collections/list", serde_json::json!({}))

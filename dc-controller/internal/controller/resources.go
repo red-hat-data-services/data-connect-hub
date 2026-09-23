@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -458,6 +459,161 @@ func setConfigMapGlobalNamespace(resources []*unstructured.Unstructured, namespa
 	}
 }
 
+// reconcileTraceEnv reconciles OTLP trace environment variables in deployments,
+// removing stale variables and setting current ones. This ensures that clearing
+// trace.insecure or trace.certificate from the CR actually removes the env vars
+// from the deployment, preventing stale security-sensitive configuration.
+func reconcileTraceEnv(resources []*unstructured.Unstructured, trace *dchv1alpha1.Trace, containerNames ...string) bool {
+	wanted := make(map[string]bool, len(containerNames))
+	for _, name := range containerNames {
+		wanted[name] = true
+	}
+
+	// Build the desired env var set
+	desiredVars := traceEnv(trace)
+	desiredMap := make(map[string]string, len(desiredVars))
+	for _, v := range desiredVars {
+		desiredMap[v.Name] = v.Value
+	}
+
+	// All OTLP env vars that must be reconciled
+	otlpVars := map[string]bool{
+		envOTLPEndpoint:    true,
+		envOTLPInsecure:    true,
+		envOTLPCertificate: true,
+	}
+
+	updated := false
+	for _, obj := range resources {
+		if obj.GetKind() != kindDeployment {
+			continue
+		}
+		containers, found, _ := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", "containers")
+		if !found {
+			continue
+		}
+		changed := false
+		for i, c := range containers {
+			container, ok := c.(map[string]any)
+			if !ok {
+				continue
+			}
+			if name, _ := container["name"].(string); !wanted[name] {
+				continue
+			}
+
+			env, _ := container["env"].([]any)
+			var newEnv []any
+
+			// Remove all OTLP env vars, preserve others
+			for _, e := range env {
+				existing, ok := e.(map[string]any)
+				if !ok {
+					newEnv = append(newEnv, e)
+					continue
+				}
+				if n, _ := existing["name"].(string); !otlpVars[n] {
+					newEnv = append(newEnv, e)
+				}
+			}
+
+			// Add back the desired OTLP env vars
+			for name, value := range desiredMap {
+				newEnv = append(newEnv, map[string]any{"name": name, "value": value})
+			}
+
+			if len(newEnv) != len(env) || len(desiredMap) > 0 {
+				container["env"] = newEnv
+				containers[i] = container
+				changed = true
+			}
+		}
+		if changed {
+			_ = unstructured.SetNestedSlice(obj.Object, containers, "spec", "template", "spec", "containers")
+			updated = true
+		}
+	}
+	return updated
+}
+
+// setDeploymentEnv sets the given environment variables on the named
+// containers, overwriting any value the base manifest already declares for the
+// same name and appending the rest. It reports whether any container matched.
+func setDeploymentEnv(resources []*unstructured.Unstructured, vars []corev1.EnvVar, containerNames ...string) bool {
+	wanted := make(map[string]bool, len(containerNames))
+	for _, name := range containerNames {
+		wanted[name] = true
+	}
+
+	updated := false
+	for _, obj := range resources {
+		if obj.GetKind() != kindDeployment {
+			continue
+		}
+		containers, found, _ := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", "containers")
+		if !found {
+			continue
+		}
+		changed := false
+		for i, c := range containers {
+			container, ok := c.(map[string]any)
+			if !ok {
+				continue
+			}
+			if name, _ := container["name"].(string); !wanted[name] {
+				continue
+			}
+
+			env, _ := container["env"].([]any)
+			for _, v := range vars {
+				entry := map[string]any{"name": v.Name, "value": v.Value}
+				replaced := false
+				for j, e := range env {
+					existing, ok := e.(map[string]any)
+					if !ok {
+						continue
+					}
+					if n, _ := existing["name"].(string); n == v.Name {
+						env[j] = entry
+						replaced = true
+					}
+				}
+				if !replaced {
+					env = append(env, entry)
+				}
+			}
+
+			container["env"] = env
+			containers[i] = container
+			changed = true
+		}
+		if changed {
+			_ = unstructured.SetNestedSlice(obj.Object, containers, "spec", "template", "spec", "containers")
+			updated = true
+		}
+	}
+	return updated
+}
+
+// traceEnv maps spec.trace onto the OTLP exporter environment variables,
+// omitting any field the CR leaves unset.
+func traceEnv(trace *dchv1alpha1.Trace) []corev1.EnvVar {
+	if trace == nil {
+		return nil
+	}
+	var vars []corev1.EnvVar
+	if trace.Exporter != "" {
+		vars = append(vars, corev1.EnvVar{Name: envOTLPEndpoint, Value: trace.Exporter})
+	}
+	if trace.Insecure != nil {
+		vars = append(vars, corev1.EnvVar{Name: envOTLPInsecure, Value: strconv.FormatBool(*trace.Insecure)})
+	}
+	if trace.Certificate != "" {
+		vars = append(vars, corev1.EnvVar{Name: envOTLPCertificate, Value: trace.Certificate})
+	}
+	return vars
+}
+
 func setConfigMapDiscoveryServiceAccount(resources []*unstructured.Unstructured, namespace, flightName string) {
 	var restServiceAccount string
 	for _, obj := range resources {
@@ -759,7 +915,7 @@ func setKubeRbacProxyAudiences(resources []*unstructured.Unstructured, audiences
 				continue
 			}
 			name, _ := container["name"].(string)
-			if name != "kube-rbac-proxy" {
+			if name != nameKubeRbacProxy {
 				continue
 			}
 			var args []any
