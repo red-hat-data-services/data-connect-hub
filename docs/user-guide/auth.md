@@ -109,6 +109,44 @@ To grant a user access to a tenant's data, an admin must:
 
     Replace `<allowed-connection-secret-name>` with your connection secret name and `dch-services` with the namespace where DCH services run. This cross-namespace ServiceAccount binding is valid because `RoleBinding` subjects include both `name` and `namespace`. If secret names are dynamic, create/update this tenant-local `Role` as needed.
 
+### REST service secret permissions
+
+The REST service also accesses Kubernetes secrets using its own ServiceAccount, independently of the caller's API permissions. The controller installs the predefined `dch-rest-secret-access` ClusterRole with `get`, `create`, `patch`, and `delete` on secrets. An admin must bind it to the REST ServiceAccount in each tenant namespace using a RoleBinding. The ClusterRole alone grants no access; DCH does not create a ClusterRoleBinding for it.
+
+| REST operation | Secret permissions required by the REST ServiceAccount |
+|---|---|
+| Create a connection with `credentials_ref` | None during creation; this only stores the reference |
+| Create a connection with inline `credentials` | `create`; `delete` to remove the new secret if storing connection metadata fails |
+| Check connection readiness | `get` on the referenced secret |
+| Export a connection to a secret | `get` on the source; `patch` on the destination, plus `create` when server-side apply creates it |
+| Test credentials without saving them | None |
+
+Deleting a connection removes its metadata, not its credential secret. The `delete` permission above is for failed-creation cleanup.
+
+Save the following as `rest-secret-rbac.yaml`, replace the namespace and ServiceAccount values, and apply it with `kubectl apply -f rest-secret-rbac.yaml`:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: dch-rest-secret-access
+  namespace: team-alpha
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: dch-rest-secret-access
+subjects:
+  - kind: ServiceAccount
+    name: dch-rest-service-sa
+    namespace: redhat-ods-applications
+```
+
+The RoleBinding's `metadata.namespace` must match the tenant (`X-Tenant-Id`); the subject namespace is where REST runs. For example, REST running in `redhat-ods-applications` needs this RoleBinding in `team-alpha` to create credentials for that tenant. It only needs these secret permissions in `redhat-ods-applications` if that namespace is also used as a tenant.
+
+This example supports dynamic secret names throughout one tenant namespace. For read-only access to existing secrets, create a tenant-local Role granting `get` with `resourceNames` and bind it instead. Kubernetes cannot restrict the `create` verb using `resourceNames`. Flight still needs its separate secret-read grant from step 4, using the actual Flight deployment's ServiceAccount and allowed secret names.
+
+Caller authorization is separate: connection creation requires `create` on `data-connections.dataconnecthub.opendatahub.io`; secret export requires `create` on core `secrets` in the tenant namespace. Granting those permissions to a caller does not grant them to the REST ServiceAccount.
+
 ## 5. Auth Flow
 
 1. Client sends a request with `Authorization: Bearer <token>` and `X-Tenant-Id: <namespace>` headers.
@@ -137,3 +175,41 @@ Authentication and authorization results are cached using in-memory Moka caches 
 - **Platform Gateway authentication is separate.** RHOAI and ODH platform Gateways can require a bearer token before forwarding health requests to DCH, even though DCH service-level health checks are anonymous.
 - **Single verb.** The Flight service checks only the `get` verb for all operations, regardless of the gRPC method called.
 - **Audience configuration must match cluster tokens.** TokenReview audiences are configurable through `auth.token_review_audiences` (default: `https://kubernetes.default.svc`), and a mismatch will cause authentication failures.
+
+## 9. Troubleshooting
+
+### Connection creation or export fails with `cannot_create_secret`
+
+The REST API returns HTTP 400 with `cannot_create_secret` when the Kubernetes secret write fails. Check the REST logs for the underlying cause, such as Kubernetes `403 Forbidden` or an existing secret name.
+
+Run these checks as an administrator with permission to impersonate the REST ServiceAccount. Replace the deployment and namespace values for your installation:
+
+```bash
+DCH_NAMESPACE=redhat-ods-applications
+DCH_REST_DEPLOYMENT=dch-rest-service
+TENANT_NAMESPACE=team-alpha
+DCH_REST_SA=$(kubectl get deployment "$DCH_REST_DEPLOYMENT" \
+  -n "$DCH_NAMESPACE" -o jsonpath='{.spec.template.spec.serviceAccountName}')
+
+kubectl get clusterrole dch-rest-secret-access
+
+kubectl logs -n "$DCH_NAMESPACE" "deployment/$DCH_REST_DEPLOYMENT" \
+  -c rest-service --since=30m --tail=100
+
+for verb in get create patch delete; do
+  kubectl auth can-i "$verb" secrets -n "$TENANT_NAMESPACE" \
+    --as="system:serviceaccount:${DCH_NAMESPACE}:${DCH_REST_SA}"
+done
+```
+
+For the full inline-credential, readiness, and export workflow, each permission check should return `yes`. If the ClusterRole is missing, upgrade the controller to a version that installs it. If a required permission returns `no`, apply the tenant-local RoleBinding from [REST service secret permissions](#rest-service-secret-permissions), then retry. Check the ServiceAccount named in the log error: REST, Flight, and the controller use different identities.
+
+An HTTP 403 from kube-rbac-proxy instead points to caller authorization. Check the caller's tenant permissions separately; changing the REST ServiceAccount's RoleBinding does not authorize the caller.
+
+### Connection creation succeeds, but readiness reports `Secret cannot be read`
+
+Creating a connection with `credentials_ref` stores metadata without reading or creating the secret. Readiness requires REST to read it, and Flight needs read access to use the connection. Verify that the secret exists in the tenant namespace and both ServiceAccounts have `get` on that secret. A successful credential test also does not prove secret access: it passes credentials directly without storing them.
+
+### E2E tests pass, but another tenant cannot create connections
+
+`e2e/run-e2e.sh` explicitly binds the predefined `dch-rest-secret-access` ClusterRole to REST in `DCH_TENANT_ID` before running tests, including when `DCH_AUTH_TOKEN` is supplied. This RoleBinding does not apply to other namespaces. Provision each new tenant's service RBAC as well as its users' API permissions.
