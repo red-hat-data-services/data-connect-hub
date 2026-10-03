@@ -245,6 +245,8 @@ You normally set `format` once, at `create_connection`, but it is not immutable:
 
 Alternatively, pass `credentials=InlineCredentials(secret="secret-name", properties={...})` when creating a connection. The service creates that Kubernetes secret and stores its reference. Exactly one of `credentials_ref` and `credentials` is required.
 
+**Cluster prerequisite:** The REST ServiceAccount needs tenant-local secret permissions: `create` for inline credentials and new export secrets, `delete` for failed-creation cleanup, `get` for readiness and export, and `patch` for export. These are separate from your token's API permissions. See [REST service secret permissions](../../docs/user-guide/auth.md#rest-service-secret-permissions) for the tenant RoleBinding setup and [troubleshooting](../../docs/user-guide/auth.md#9-troubleshooting) for permission checks.
+
 Use `test_credentials` to validate credentials without storing them, `check_connection_readiness` to refresh a saved connection's status, and `export_connection` to copy its credentials and metadata into another Kubernetes secret.
 
 The credential keys must match the connection type's `credentials_fields`. For example, a PostgreSQL connection can be tested and created with inline credentials before its status is refreshed:
