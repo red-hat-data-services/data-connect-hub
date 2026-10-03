@@ -18,12 +18,12 @@ package controller
 
 import (
 	"context"
-	"fmt"
 	"path/filepath"
 	"slices"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	toml "github.com/pelletier/go-toml/v2"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -50,9 +50,8 @@ var _ = Describe("DataConnectService Controller", func() {
 		testFlightImage = "quay.io/opendatahub/odh-data-connect-hub-flight:odh-stable"
 
 		// Kustomize adds this prefix to all resource names.
-		np                  = "dch-"
-		flightResourceName  = np + resourceName + "-flight"
-		flightContainerName = resourceName + "-flight"
+		np                 = "dch-"
+		flightResourceName = np + resourceName + "-flight"
 	)
 
 	ctx := context.Background()
@@ -197,7 +196,7 @@ var _ = Describe("DataConnectService Controller", func() {
 
 			restDeploy := &appsv1.Deployment{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: np + nameRestService, Namespace: targetNamespace}, restDeploy)).To(Succeed())
-			restContainer := findContainer(restDeploy, nameRestService)
+			restContainer := findContainer(restDeploy, nameRestServiceContainer)
 			Expect(restContainer).NotTo(BeNil())
 			Expect(restContainer.Image).To(Equal(testRestImage))
 			Expect(restContainer.ImagePullPolicy).To(Equal(corev1.PullAlways))
@@ -205,11 +204,16 @@ var _ = Describe("DataConnectService Controller", func() {
 
 			flightDeploy := &appsv1.Deployment{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: flightResourceName, Namespace: targetNamespace}, flightDeploy)).To(Succeed())
+			Expect(findContainer(flightDeploy, nameFlightServiceContainer)).NotTo(BeNil())
 			Expect(flightDeploy.Spec.Template.Spec.Containers[0].Image).To(Equal(testFlightImage))
 
 			restConfig := &corev1.ConfigMap{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: np + nameRestService + "-config", Namespace: targetNamespace}, restConfig)).To(Succeed())
-			Expect(restConfig.Data["config.toml"]).To(ContainSubstring(fmt.Sprintf("address = %q", flightResourceName+"."+targetNamespace+".svc")))
+			var restConfigTOML map[string]any
+			Expect(toml.Unmarshal([]byte(restConfig.Data["config.toml"]), &restConfigTOML)).To(Succeed())
+			flightService, ok := restConfigTOML["flight-service"].(map[string]any)
+			Expect(ok).To(BeTrue(), "expected [flight-service] section in REST config")
+			Expect(flightService["address"]).To(Equal(flightResourceName + "." + targetNamespace + ".svc"))
 		})
 
 		It("should create services for rest and flight", func() {
@@ -331,7 +335,7 @@ var _ = Describe("DataConnectService Controller", func() {
 
 			deploy := &appsv1.Deployment{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: np + nameRestService, Namespace: targetNamespace}, deploy)).To(Succeed())
-			restContainer := findContainer(deploy, nameRestService)
+			restContainer := findContainer(deploy, nameRestServiceContainer)
 			Expect(restContainer).NotTo(BeNil())
 			Expect(*deploy.Spec.Replicas).To(Equal(int32(3)))
 		})
@@ -341,7 +345,7 @@ var _ = Describe("DataConnectService Controller", func() {
 
 			deploy := &appsv1.Deployment{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: np + nameRestService, Namespace: targetNamespace}, deploy)).To(Succeed())
-			restContainer := findContainer(deploy, nameRestService)
+			restContainer := findContainer(deploy, nameRestServiceContainer)
 			Expect(restContainer).NotTo(BeNil())
 			Expect(restContainer.Resources.Requests.Cpu().String()).To(Equal("200m"))
 		})
@@ -353,7 +357,7 @@ var _ = Describe("DataConnectService Controller", func() {
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: np + nameRestService, Namespace: targetNamespace}, deploy)).To(Succeed())
 
 			envNames := make(map[string]string)
-			restContainer := findContainer(deploy, nameRestService)
+			restContainer := findContainer(deploy, nameRestServiceContainer)
 			Expect(restContainer).NotTo(BeNil())
 			for _, e := range restContainer.Env {
 				envNames[e.Name] = e.Value
@@ -389,8 +393,11 @@ var _ = Describe("DataConnectService Controller", func() {
 
 			cm := &corev1.ConfigMap{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: flightResourceName + "-config", Namespace: targetNamespace}, cm)).To(Succeed())
-			toml := cm.Data["config.toml"]
-			Expect(toml).To(ContainSubstring(`token_review_audiences = ["https://rh-oidc.s3.us-east-1.amazonaws.com/test-cluster-id"]`))
+			var flightConfigTOML map[string]any
+			Expect(toml.Unmarshal([]byte(cm.Data["config.toml"]), &flightConfigTOML)).To(Succeed())
+			auth, ok := flightConfigTOML["auth"].(map[string]any)
+			Expect(ok).To(BeTrue(), "expected [auth] section in flight config")
+			Expect(auth["token_review_audiences"]).To(Equal([]any{"https://rh-oidc.s3.us-east-1.amazonaws.com/test-cluster-id"}))
 		})
 
 		It("should add --auth-token-audiences to kube-rbac-proxy", func() {
@@ -441,7 +448,7 @@ var _ = Describe("DataConnectService Controller", func() {
 			// Check rest-service
 			restDeploy := &appsv1.Deployment{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: np + nameRestService, Namespace: targetNamespace}, restDeploy)).To(Succeed())
-			restContainer := findContainer(restDeploy, nameRestService)
+			restContainer := findContainer(restDeploy, nameRestServiceContainer)
 			Expect(restContainer).NotTo(BeNil())
 			Expect(restContainer.Env).To(ContainElements(
 				corev1.EnvVar{Name: envOTLPEndpoint, Value: exporter},
@@ -452,7 +459,7 @@ var _ = Describe("DataConnectService Controller", func() {
 			// Check flight-service
 			flightDeploy := &appsv1.Deployment{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: flightResourceName, Namespace: targetNamespace}, flightDeploy)).To(Succeed())
-			flightContainer := findContainer(flightDeploy, flightContainerName)
+			flightContainer := findContainer(flightDeploy, nameFlightServiceContainer)
 			Expect(flightContainer).NotTo(BeNil())
 			Expect(flightContainer.Env).To(ContainElements(
 				corev1.EnvVar{Name: envOTLPEndpoint, Value: exporter},
@@ -498,7 +505,7 @@ var _ = Describe("DataConnectService Controller", func() {
 			// Check rest-service
 			restDeploy := &appsv1.Deployment{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: np + nameRestService, Namespace: targetNamespace}, restDeploy)).To(Succeed())
-			restContainer := findContainer(restDeploy, nameRestService)
+			restContainer := findContainer(restDeploy, nameRestServiceContainer)
 			Expect(restContainer).NotTo(BeNil())
 			for _, e := range restContainer.Env {
 				Expect(e.Name).NotTo(HavePrefix("OTEL_"))
@@ -507,7 +514,7 @@ var _ = Describe("DataConnectService Controller", func() {
 			// Check flight-service
 			flightDeploy := &appsv1.Deployment{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: flightResourceName, Namespace: targetNamespace}, flightDeploy)).To(Succeed())
-			flightContainer := findContainer(flightDeploy, flightContainerName)
+			flightContainer := findContainer(flightDeploy, nameFlightServiceContainer)
 			Expect(flightContainer).NotTo(BeNil())
 			for _, e := range flightContainer.Env {
 				Expect(e.Name).NotTo(HavePrefix("OTEL_"))
