@@ -152,14 +152,10 @@ setup_service_rbac() {
             --dry-run=client -o yaml | kubectl apply -f - >/dev/null
     fi
 
-    # Allow the REST service SA to export K8s secret in tenant namespace (only needed by REST API /connections/{id}/exports/secrets/{secret_name})
-    kubectl create role e2e-rest-secret-export \
+    # Grant REST tenant secret access for inline credentials, rollback, readiness, and export.
+    kubectl create rolebinding dch-rest-secret-access \
         -n "$DCH_TENANT_ID" \
-        --verb=get,create,patch --resource=secrets \
-        --dry-run=client -o yaml | kubectl apply -f - >/dev/null
-    kubectl create rolebinding e2e-rest-secret-export-rb \
-        -n "$DCH_TENANT_ID" \
-        --role=e2e-rest-secret-export \
+        --clusterrole=dch-rest-secret-access \
         --serviceaccount="${DCH_SERVICE_NAMESPACE}:${DCH_REST_SA}" \
         --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 }
