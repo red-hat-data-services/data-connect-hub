@@ -3,6 +3,8 @@
 set -euo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/lib.sh"
 
+CI_E2E_RUNTIME_BASE_IMAGE=registry.access.redhat.com/ubi9/ubi-minimal
+
 # ===================================================================
 # Build images
 # ===================================================================
@@ -10,10 +12,14 @@ source "$(cd "$(dirname "$0")" && pwd)/lib.sh"
 echo "=== Building images ==="
 
 echo "--- Building flight-service ---"
-docker build -t "$CI_FLIGHT_IMAGE" -f "$CI_REPO_ROOT/services/flight/Containerfile.konflux" "$CI_REPO_ROOT"
+docker build \
+    --build-arg "RUNTIME_BASE_IMAGE=${CI_E2E_RUNTIME_BASE_IMAGE}" \
+    -t "$CI_FLIGHT_IMAGE" -f "$CI_REPO_ROOT/services/flight/Containerfile.konflux" "$CI_REPO_ROOT"
 
 echo "--- Building rest-service ---"
-docker build -t "$CI_REST_IMAGE" -f "$CI_REPO_ROOT/services/rest/Containerfile.konflux" "$CI_REPO_ROOT"
+docker build \
+    --build-arg "RUNTIME_BASE_IMAGE=${CI_E2E_RUNTIME_BASE_IMAGE}" \
+    -t "$CI_REST_IMAGE" -f "$CI_REPO_ROOT/services/rest/Containerfile.konflux" "$CI_REPO_ROOT"
 
 echo "--- Building dc-controller ---"
 sed -E -i.bak 's/^([[:space:]]*imagePullPolicy:).*/\1 IfNotPresent/' \
@@ -22,7 +28,9 @@ rm -f "$CI_REPO_ROOT/config/base/flight-service/deployment.yaml.bak"
 sed -E -i.bak 's/^([[:space:]]*imagePullPolicy:).*/\1 IfNotPresent/' \
     "$CI_REPO_ROOT/config/base/rest-service/deployment.yaml"
 rm -f "$CI_REPO_ROOT/config/base/rest-service/deployment.yaml.bak"
-docker build -t "$CI_CONTROLLER_IMAGE" -f "$CI_REPO_ROOT/dc-controller/Containerfile.konflux" "$CI_REPO_ROOT"
+docker build \
+    --build-arg "RUNTIME_BASE_IMAGE=${CI_E2E_RUNTIME_BASE_IMAGE}" \
+    -t "$CI_CONTROLLER_IMAGE" -f "$CI_REPO_ROOT/dc-controller/Containerfile.konflux" "$CI_REPO_ROOT"
 
 # ===================================================================
 # Load images into kind
@@ -32,6 +40,12 @@ echo "=== Loading images into kind ==="
 kind load docker-image "$CI_FLIGHT_IMAGE" --name "$CI_KIND_CLUSTER_NAME"
 kind load docker-image "$CI_REST_IMAGE" --name "$CI_KIND_CLUSTER_NAME"
 kind load docker-image "$CI_CONTROLLER_IMAGE" --name "$CI_KIND_CLUSTER_NAME"
+
+echo "=== Loading tracing images into kind ==="
+docker pull "$CI_OTEL_COLLECTOR_IMAGE"
+docker pull "$CI_JAEGER_IMAGE"
+kind load docker-image "$CI_OTEL_COLLECTOR_IMAGE" --name "$CI_KIND_CLUSTER_NAME"
+kind load docker-image "$CI_JAEGER_IMAGE" --name "$CI_KIND_CLUSTER_NAME"
 
 assert_deployment_image() {
     local deployment="$1"
@@ -129,6 +143,121 @@ kubectl create configmap dch-flight-service-ca -n "$CI_SVC_NAMESPACE" \
 rm -f "${CI_TEMP_DIR}"/*-tls.key "${CI_TEMP_DIR}"/*-tls.crt
 
 # ===================================================================
+# Tracing: OTEL Collector + Jaeger
+# ===================================================================
+
+echo "=== Deploying Jaeger ==="
+kubectl apply -n "$CI_SVC_NAMESPACE" -f - <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jaeger
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: jaeger
+  template:
+    metadata:
+      labels:
+        app: jaeger
+    spec:
+      containers:
+      - name: jaeger
+        image: ${CI_JAEGER_IMAGE}
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 4317
+        - containerPort: 16686
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jaeger
+spec:
+  selector:
+    app: jaeger
+  ports:
+  - name: otlp-grpc
+    port: 4317
+    targetPort: 4317
+  - name: query
+    port: 16686
+    targetPort: 16686
+EOF
+
+echo "=== Deploying OTEL Collector ==="
+kubectl apply -n "$CI_SVC_NAMESPACE" -f - <<'OTELCFG'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector-config
+data:
+  config.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+    exporters:
+      otlp:
+        endpoint: jaeger:4317
+        tls:
+          insecure: true
+    service:
+      pipelines:
+        traces:
+          receivers: [otlp]
+          exporters: [otlp]
+OTELCFG
+
+kubectl apply -n "$CI_SVC_NAMESPACE" -f - <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: otel-collector
+  template:
+    metadata:
+      labels:
+        app: otel-collector
+    spec:
+      containers:
+      - name: otel-collector
+        image: ${CI_OTEL_COLLECTOR_IMAGE}
+        imagePullPolicy: IfNotPresent
+        args: ["--config=/etc/otel/config.yaml"]
+        ports:
+        - containerPort: 4317
+        volumeMounts:
+        - name: config
+          mountPath: /etc/otel
+      volumes:
+      - name: config
+        configMap:
+          name: otel-collector-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector
+spec:
+  selector:
+    app: otel-collector
+  ports:
+  - name: otlp-grpc
+    port: 4317
+    targetPort: 4317
+EOF
+
+kubectl rollout status deployment/jaeger -n "$CI_SVC_NAMESPACE" --timeout=120s
+kubectl rollout status deployment/otel-collector -n "$CI_SVC_NAMESPACE" --timeout=120s
+
+# ===================================================================
 # dc-controller (Helm)
 # ===================================================================
 
@@ -172,6 +301,9 @@ spec:
   gateway:
     name: ${CI_GATEWAY_NAME}
     namespace: ${CI_GATEWAY_NAMESPACE}
+  trace:
+    exporter: "http://otel-collector.${CI_SVC_NAMESPACE}.svc:4317"
+    insecure: true
   restService:
     env:
       - name: RUST_LOG
@@ -257,6 +389,25 @@ spec:
     nodePort: ${CI_REST_METRICS_NODE_PORT}
 EOF
 
+# ===================================================================
+# Jaeger query NodePort (mapped to localhost via kind extraPortMappings)
+# ===================================================================
+
+echo "=== Creating Jaeger query NodePort service ==="
+kubectl apply -n "$CI_SVC_NAMESPACE" -f - <<EOF
+apiVersion: v1
+kind: Service
+metadata:
+  name: jaeger-query-nodeport
+spec:
+  type: NodePort
+  selector:
+    app: jaeger
+  ports:
+  - port: 16686
+    targetPort: 16686
+    nodePort: ${CI_JAEGER_NODE_PORT}
+EOF
 
 # ===================================================================
 # Tenant data sources for E2E connectors

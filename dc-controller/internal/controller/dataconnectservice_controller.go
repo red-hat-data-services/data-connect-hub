@@ -123,6 +123,7 @@ type DataConnectServiceReconciler struct {
 	RestImage           string
 	FlightImage         string
 	KubeRbacProxyImage  string
+	ControllerNamespace string
 	FlightServiceClient FlightServiceClient
 }
 
@@ -405,8 +406,14 @@ func (r *DataConnectServiceReconciler) reconcileManifests(
 		RelatedImageRestService:   r.RestImage,
 		RelatedImageFlightService: r.FlightImage,
 		RelatedImageKubeRbacProxy: r.KubeRbacProxyImage,
+		"GATEWAY_NAME":            gw.Name,
+		"GATEWAY_NAMESPACE":       gw.Namespace,
+		"OPERAND_NAMESPACE":       cr.Namespace,
 	}
-	resources, err := renderKustomization(r.ManifestsPath, manifestPath, patches, nil, paramsEnvOverrides)
+	if r.ControllerNamespace != "" {
+		paramsEnvOverrides["CONTROLLER_NAMESPACE"] = r.ControllerNamespace
+	}
+	resources, err := renderKustomization(r.ManifestsPath, manifestPath, patches, paramsEnvOverrides)
 	if err != nil {
 		return fmt.Errorf("rendering manifests: %w", err)
 	}
@@ -569,9 +576,11 @@ func (r *DataConnectServiceReconciler) ensureInitDataConnectionTypes(ctx context
 
 type connectionTypeFile struct {
 	Name              string                   `json:"name"`
+	Label             string                   `json:"label"`
 	Provider          string                   `json:"provider"`
 	Description       string                   `json:"description"`
 	CredentialsFields []connectionTypeFieldDef `json:"credentials_fields"`
+	Tags              []string                 `json:"tags"`
 }
 
 type connectionTypeFieldDef struct {
@@ -603,6 +612,10 @@ func (f *connectionTypeFile) toIDCTSpec() dchv1alpha1.InitDataConnectionTypeSpec
 		Name:              f.Name,
 		Provider:          f.Provider,
 		CredentialsFields: fields,
+		Tags:              f.Tags,
+	}
+	if f.Label != "" {
+		spec.Label = &f.Label
 	}
 	if f.Description != "" {
 		spec.Description = &f.Description
