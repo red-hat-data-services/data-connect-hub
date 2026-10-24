@@ -885,8 +885,7 @@
             },
             "description": "Credential key-value pairs to store in the secret",
             "example": {
-              "username": "pg_user",
-              "password": "pg_pass"
+              "URI": "postgres://pg_user:pg_pass@db.example.com:5432/mydb"
             }
           }
         },
@@ -979,9 +978,7 @@
             },
             "description": "Credential key-value pairs to test",
             "example": {
-              "username": "pg_user",
-              "password": "pg_pass",
-              "host": "db.example.com"
+              "URI": "postgres://pg_user:pg_pass@db.example.com:5432/mydb"
             }
           }
         }
@@ -1014,15 +1011,16 @@
         "properties": {
           "name": {
             "type": "string",
-            "example": "url"
+            "example": "URI"
           },
           "label": {
             "type": "string",
-            "example": "Connection URL"
+            "example": "Connection URI"
           },
           "description": {
             "type": "string",
-            "nullable": true
+            "nullable": true,
+            "example": "PostgreSQL connection URI"
           },
           "required": {
             "type": "boolean"
@@ -1034,6 +1032,7 @@
           "enum_values": {
             "type": "array",
             "nullable": true,
+            "description": "Allowed values; only meaningful when ``type`` is ``enum``.\n",
             "items": {
               "$ref": "#/components/schemas/EnumValue"
             }
@@ -1057,6 +1056,12 @@
             "description": "The name of the connection type. This name is unique for connection types of this tenant.",
             "example": "PostgreSQL"
           },
+          "label": {
+            "type": "string",
+            "nullable": true,
+            "description": "Optional display label for the connection type. When present the UI should render this instead of the short ``name``.\n",
+            "example": "PostgreSQL database"
+          },
           "provider": {
             "type": "string",
             "example": "postgres"
@@ -1070,18 +1075,47 @@
             "items": {
               "$ref": "#/components/schemas/Field"
             }
+          },
+          "tags": {
+            "type": "array",
+            "nullable": true,
+            "description": "Arbitrary labels for categorising the connection type (e.g. \"domain: database\", \"engine: postgresql\").\n",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "example": [
+              "domain: database",
+              "engine: postgresql",
+              "access: sql"
+            ]
           }
         }
       },
       "DataConnectionTypeStatus": {
         "type": "object",
         "required": [
+          "supported_formats",
           "flight_ready"
         ],
         "properties": {
+          "supported_formats": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "tabular",
+                "binary"
+              ]
+            },
+            "description": "Data formats this connection type supports, determined by the registered Flight connector.  Independent of flight_ready — the list stays stable even when the Flight pod is down.  An empty list means the type is credentials-only, with no built-in ingestion.",
+            "example": [
+              "tabular"
+            ]
+          },
           "flight_ready": {
             "type": "boolean",
-            "description": "Whether a Flight gRPC service supports this connection type"
+            "description": "Whether a Flight gRPC service supports this connection type and is currently running"
           },
           "flight_url": {
             "type": "string",
@@ -1144,6 +1178,10 @@
           "name": {
             "type": "string"
           },
+          "label": {
+            "type": "string",
+            "nullable": true
+          },
           "provider": {
             "type": "string"
           },
@@ -1155,6 +1193,15 @@
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/Field"
+            }
+          },
+          "tags": {
+            "type": "array",
+            "nullable": true,
+            "description": "Arbitrary labels for categorising the connection type.",
+            "items": {
+              "type": "string",
+              "minLength": 1
             }
           }
         }

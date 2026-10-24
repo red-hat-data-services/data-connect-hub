@@ -12,15 +12,20 @@ mkdir -p "$CI_TEMP_DIR"
 CI_KIND_CLUSTER_NAME="${CI_KIND_CLUSTER_NAME:-dch-e2e}"
 
 # Namespaces
-CI_SVC_NAMESPACE="${CI_SVC_NAMESPACE:-dch}"
-CI_CONTROLLER_NAMESPACE="${CI_CONTROLLER_NAMESPACE:-dch}"
+CI_SVC_NAMESPACE="${CI_SVC_NAMESPACE:-dch-service}"
+CI_CONTROLLER_NAMESPACE="${CI_CONTROLLER_NAMESPACE:-dch-controller}"
 CI_TENANT_NAMESPACE="${CI_TENANT_NAMESPACE:-dch-tenant}"
 CI_NO_ACCESS_NAMESPACE="${CI_NO_ACCESS_NAMESPACE:-no-access-ns}"
 
 # Gateway
 CI_GATEWAY_NAME="${CI_GATEWAY_NAME:-dch-gateway}"
-CI_GATEWAY_NAMESPACE="${CI_GATEWAY_NAMESPACE:-dch}"
+CI_GATEWAY_NAMESPACE="${CI_GATEWAY_NAMESPACE:-dch-gateway}"
 CI_GATEWAY_LOCAL_PORT="${CI_GATEWAY_LOCAL_PORT:-18443}"
+
+# Istio — installed from the official OCI charts at
+# ghcr.io/istio/release/charts (the old istio-release.storage.googleapis.com
+# helm repo is being retired and returns 403 during migration).
+CI_ISTIO_VERSION="${CI_ISTIO_VERSION:-1.31.1}"
 
 # DataConnectService CR name (must be set before flight service names)
 CI_DCS_CR_NAME="${CI_DCS_CR_NAME:-default-dcs}"
@@ -45,10 +50,16 @@ CI_KUBE_RBAC_PROXY_IMAGE="${CI_KUBE_RBAC_PROXY_IMAGE:-quay.io/opendatahub/odh-ku
 CI_FLIGHT_METRICS_LOCAL_PORT="${CI_FLIGHT_METRICS_LOCAL_PORT:-19090}"
 CI_REST_METRICS_LOCAL_PORT="${CI_REST_METRICS_LOCAL_PORT:-19091}"
 
+# Tracing (OTEL Collector + Jaeger)
+CI_JAEGER_LOCAL_PORT="${CI_JAEGER_LOCAL_PORT:-16686}"
+CI_OTEL_COLLECTOR_IMAGE="${CI_OTEL_COLLECTOR_IMAGE:-docker.io/otel/opentelemetry-collector:0.120.0}"
+CI_JAEGER_IMAGE="${CI_JAEGER_IMAGE:-docker.io/jaegertracing/jaeger:2.6.0}"
+
 # NodePorts (mapped to localhost via kind extraPortMappings)
 CI_GATEWAY_NODE_PORT="${CI_GATEWAY_NODE_PORT:-30443}"
 CI_FLIGHT_METRICS_NODE_PORT="${CI_FLIGHT_METRICS_NODE_PORT:-30090}"
 CI_REST_METRICS_NODE_PORT="${CI_REST_METRICS_NODE_PORT:-30091}"
+CI_JAEGER_NODE_PORT="${CI_JAEGER_NODE_PORT:-30686}"
 
 # System PostgreSQL
 CI_SYS_PG_HOST="${CI_SYS_PG_HOST:-dch-postgres}"
