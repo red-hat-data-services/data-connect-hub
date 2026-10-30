@@ -20,6 +20,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/sha256"
+	cryptotls "crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -30,6 +31,8 @@ import (
 	"strings"
 	"time"
 
+	platformtls "github.com/opendatahub-io/odh-platform-utilities/framework/tls"
+	configv1 "github.com/openshift/api/config/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -49,6 +52,8 @@ import (
 // --- Kustomize rendering ---
 
 const (
+	resourceNameField = "name"
+
 	// RelatedImageRestService is the env var and params.env key for the REST image.
 	RelatedImageRestService = "RELATED_IMAGE_ODH_DATA_CONNECT_HUB_REST_IMAGE"
 	// RelatedImageFlightService is the env var and params.env key for the Flight image.
@@ -62,7 +67,7 @@ const (
 // may reference resources outside its own directory (overlays/openshift pulls in
 // ../../base). rootPath must contain diskPath. params override values in the
 // staged base/params.env before Kustomize resolves replacements.
-func renderKustomization(rootPath, diskPath string, patches []kustypes.Patch, images []kustypes.Image, params map[string]string) ([]*unstructured.Unstructured, error) {
+func renderKustomization(rootPath, diskPath string, patches []kustypes.Patch, params map[string]string) ([]*unstructured.Unstructured, error) {
 	absPath, err := filepath.Abs(diskPath)
 	if err != nil {
 		return nil, fmt.Errorf("resolving path %s: %w", diskPath, err)
@@ -84,8 +89,8 @@ func renderKustomization(rootPath, diskPath string, patches []kustypes.Patch, im
 		}
 	}
 
-	if len(patches) > 0 || len(images) > 0 {
-		if err := patchKustomization(memFS, absPath, patches, images); err != nil {
+	if len(patches) > 0 {
+		if err := patchKustomization(memFS, absPath, patches); err != nil {
 			return nil, fmt.Errorf("patching kustomization: %w", err)
 		}
 	}
@@ -180,7 +185,7 @@ func mergeParamsEnv(fs filesys.FileSystem, path string, overrides map[string]str
 	return nil
 }
 
-func patchKustomization(fs filesys.FileSystem, dir string, patches []kustypes.Patch, images []kustypes.Image) error {
+func patchKustomization(fs filesys.FileSystem, dir string, patches []kustypes.Patch) error {
 	kustPath := filepath.Join(dir, "kustomization.yaml")
 	data, err := fs.ReadFile(kustPath)
 	if err != nil {
@@ -203,19 +208,6 @@ func patchKustomization(fs filesys.FileSystem, dir string, patches []kustypes.Pa
 		}
 		existing, _ := kust["patches"].([]any)
 		kust["patches"] = append(existing, patchSlice...)
-	}
-
-	if len(images) > 0 {
-		imgBytes, err := json.Marshal(images)
-		if err != nil {
-			return err
-		}
-		var imgSlice []any
-		if err := json.Unmarshal(imgBytes, &imgSlice); err != nil {
-			return err
-		}
-		existing, _ := kust["images"].([]any)
-		kust["images"] = append(existing, imgSlice...)
 	}
 
 	out, err := sigyaml.Marshal(kust)
@@ -507,12 +499,12 @@ func reconcileTraceEnv(resources []*unstructured.Unstructured, trace *dchv1alpha
 		wanted[name] = true
 	}
 
-	// Build the desired env var set
+	// Build the desired env var set. desiredVars keeps the deterministic order
+	// from traceEnv: iterating it directly (rather than a map, whose iteration
+	// order is randomized) keeps the rendered env list stable across
+	// reconciles, avoiding pointless deployment spec churn and rolling
+	// restarts.
 	desiredVars := traceEnv(trace)
-	desiredMap := make(map[string]string, len(desiredVars))
-	for _, v := range desiredVars {
-		desiredMap[v.Name] = v.Value
-	}
 
 	// All OTLP env vars that must be reconciled
 	otlpVars := map[string]bool{
@@ -556,11 +548,11 @@ func reconcileTraceEnv(resources []*unstructured.Unstructured, trace *dchv1alpha
 			}
 
 			// Add back the desired OTLP env vars
-			for name, value := range desiredMap {
-				newEnv = append(newEnv, map[string]any{"name": name, "value": value})
+			for _, v := range desiredVars {
+				newEnv = append(newEnv, map[string]any{"name": v.Name, "value": v.Value})
 			}
 
-			if len(newEnv) != len(env) || len(desiredMap) > 0 {
+			if len(newEnv) != len(env) || len(desiredVars) > 0 {
 				container["env"] = newEnv
 				containers[i] = container
 				changed = true
@@ -931,6 +923,111 @@ func setKubeRbacProxyAudiences(resources []*unstructured.Unstructured, audiences
 		}
 		_ = unstructured.SetNestedSlice(obj.Object, containers, "spec", "template", "spec", "containers")
 	}
+}
+
+func setKubeRbacProxyTLSOpts(
+	ctx context.Context,
+	resources []*unstructured.Unstructured,
+	spec configv1.TLSProfileSpec,
+) {
+	minVersion := platformtls.MinVersionFromSpec(ctx, &spec, platformtls.FormatGo)
+	cipherSuites := ""
+	if spec.MinTLSVersion != configv1.VersionTLS13 {
+		cipherSuites = platformtls.CipherSuitesFromSpec(ctx, &spec)
+	}
+	for _, obj := range resources {
+		if obj.GetKind() != kindDeployment {
+			continue
+		}
+		containers, found, _ := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", "containers")
+		if !found {
+			continue
+		}
+		for i, c := range containers {
+			container, ok := c.(map[string]any)
+			if !ok || container[resourceNameField] != nameKubeRbacProxy {
+				continue
+			}
+			var args []any
+			if existing, ok := container["args"].([]any); ok {
+				for index := 0; index < len(existing); index++ {
+					arg, _ := existing[index].(string)
+					if arg == "--tls-min-version" || arg == "--tls-cipher-suites" {
+						index++
+						continue
+					}
+					if strings.HasPrefix(arg, "--tls-min-version=") || strings.HasPrefix(arg, "--tls-cipher-suites=") {
+						continue
+					}
+					args = append(args, existing[index])
+				}
+			}
+			args = append(args, "--tls-min-version="+minVersion)
+			if cipherSuites != "" {
+				args = append(args, "--tls-cipher-suites="+cipherSuites)
+			}
+			container["args"] = args
+			containers[i] = container
+		}
+		_ = unstructured.SetNestedSlice(obj.Object, containers, "spec", "template", "spec", "containers")
+	}
+}
+
+// setConfigMapFlightTLSProfile projects the resolved cluster TLS profile into
+// every rendered Flight instance ConfigMap so the gRPC listener enforces the
+// same minimum version and TLS <= 1.2 cipher suites as the rest of the
+// platform. DCH is an adhering component: reconcileManifests resolves the
+// profile once and applies it to all serving surfaces regardless of adherence
+// policy. Cipher names are converted through the framework to IANA names the
+// rustls listener understands, and a profile whose cipher list is entirely
+// unusable fails the reconcile instead of silently starting with defaults.
+// The Flight service itself fails fast at startup on minima its rustls build
+// cannot serve (e.g. Old's TLS 1.0) rather than silently downgrading.
+func setConfigMapFlightTLSProfile(ctx context.Context, resources []*unstructured.Unstructured, flightName string, spec configv1.TLSProfileSpec) error {
+	minVersion := platformtls.MinVersionFromSpec(ctx, &spec, platformtls.FormatGo)
+
+	var cipherSuites []string
+	if spec.MinTLSVersion != configv1.VersionTLS13 {
+		scratch := &cryptotls.Config{}
+		tlsOption, _ := platformtls.ConfigFromProfile(spec)
+		tlsOption(scratch)
+		for _, id := range scratch.CipherSuites {
+			if name := cryptotls.CipherSuiteName(id); name != "" {
+				cipherSuites = append(cipherSuites, name)
+			}
+		}
+		if len(spec.Ciphers) > 0 && len(cipherSuites) == 0 {
+			return fmt.Errorf("flight TLS profile has no usable cipher suites for TLS <= 1.2: %v", spec.Ciphers)
+		}
+	}
+
+	for _, obj := range resources {
+		if obj.GetKind() != kindConfigMap || obj.GetLabels()[labelAppName] != flightName {
+			continue
+		}
+		config, data, err := parseConfigMapTOML(obj)
+		if err != nil {
+			return fmt.Errorf("parsing flight-service ConfigMap %q: %w", obj.GetName(), err)
+		}
+		if config == nil {
+			continue
+		}
+		tls, ok := config["tls"].(map[string]any)
+		if !ok {
+			continue
+		}
+		tls["min_version"] = minVersion
+		// TLS 1.3 cipher suites stay runtime-managed by the listener.
+		if len(cipherSuites) > 0 {
+			tls["ciphers"] = cipherSuites
+		} else {
+			delete(tls, "ciphers")
+		}
+		if err := setConfigMapTOML(obj, config, data); err != nil {
+			return fmt.Errorf("updating flight-service ConfigMap %q: %w", obj.GetName(), err)
+		}
+	}
+	return nil
 }
 
 // annotateDeploymentsWithContentHash computes a combined hash of all

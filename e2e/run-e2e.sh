@@ -75,16 +75,17 @@ DCH_TENANT_NEO4J_PASSWORD="${DCH_TENANT_NEO4J_PASSWORD:-dch_readonly}"
 # URI connector
 DCH_TENANT_URI_DEPLOY_SERVER="${DCH_TENANT_URI_DEPLOY_SERVER:-true}"
 
-E2E_SA_NAME="e2e-user"
-E2E_DENIED_SA_NAME="e2e-denied-user"
-PG_SECRET="e2e-pg-creds"
-S3_SECRET="e2e-s3-creds"
-MILVUS_SECRET="e2e-milvus-creds"
-ES_BASIC_SECRET="e2e-es-basic-creds"
-ES_APIKEY_SECRET="e2e-es-apikey-creds"
-NEO4J_SECRET="e2e-neo4j-creds"
-URI_SECRET="e2e-uri-creds"
-URI_SERVER_NAME="e2e-uri-server"
+E2E_SA_NAME="dch-e2e-user"
+E2E_SECRET_READER_SA_NAME="dch-e2e-secret-reader"
+E2E_DENIED_SA_NAME="dch-e2e-denied-user"
+PG_SECRET="dch-e2e-pg-creds"
+S3_SECRET="dch-e2e-s3-creds"
+MILVUS_SECRET="dch-e2e-milvus-creds"
+ES_BASIC_SECRET="dch-e2e-es-basic-creds"
+ES_APIKEY_SECRET="dch-e2e-es-apikey-creds"
+NEO4J_SECRET="dch-e2e-neo4j-creds"
+URI_SECRET="dch-e2e-uri-creds"
+URI_SERVER_NAME="dch-e2e-uri-server"
 ENV_FILE="$SCRIPT_DIR/.env"
 
 # -------------------------------------------------------------------
@@ -101,6 +102,10 @@ setup_user_accounts() {
         kubectl create sa "$E2E_SA_NAME" -n "$DCH_TENANT_ID" 2>/dev/null || true
     fi
 
+    if [[ -z "${DCH_SECRET_READER_AUTH_TOKEN:-}" ]]; then
+        kubectl create sa "$E2E_SECRET_READER_SA_NAME" -n "$DCH_TENANT_ID" 2>/dev/null || true
+    fi
+
     if [[ -z "${DCH_DENIED_AUTH_TOKEN:-}" ]]; then
         kubectl create sa "$E2E_DENIED_SA_NAME" -n "$DCH_TENANT_ID" 2>/dev/null || true
     fi
@@ -109,16 +114,45 @@ setup_user_accounts() {
 setup_user_rbac() {
     if [[ -z "${DCH_AUTH_TOKEN:-}" ]]; then
         # Allow the e2e test SA to call DCH REST/Flight APIs (Operations on connections & connection types)
-        kubectl delete rolebinding e2e-user-access -n "$DCH_TENANT_ID" --ignore-not-found >/dev/null
-        kubectl create rolebinding e2e-user-access \
+        kubectl delete rolebinding dch-e2e-user-access -n "$DCH_TENANT_ID" --ignore-not-found >/dev/null
+        kubectl create rolebinding dch-e2e-user-access \
             -n "$DCH_TENANT_ID" \
             --clusterrole=dch-read-write \
             --serviceaccount="${DCH_TENANT_ID}:${E2E_SA_NAME}" >/dev/null
         # Allow the e2e test SA call DCH REST API /connections/{id}/exports/secrets/{secret_name} (see kube-rbac-proxy)
-        kubectl create rolebinding e2e-user-export-secret-rb \
+        kubectl create rolebinding dch-e2e-user-export-secret-rb \
             -n "$DCH_TENANT_ID" \
             --clusterrole=dch-secret-export \
             --serviceaccount="${DCH_TENANT_ID}:${E2E_SA_NAME}" \
+            --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+    fi
+
+    if [[ -z "${DCH_SECRET_READER_AUTH_TOKEN:-}" ]]; then
+        # The secret-reader SA holds the same API access as the e2e user
+        # plus read access to the datasource secrets, so export tests can
+        # cover both outcomes of the service-side SubjectAccessReview. The
+        # plain e2e user deliberately lacks the secret read so the
+        # service-side check denies its exports.
+        kubectl delete rolebinding dch-e2e-user-secret-read-rb -n "$DCH_TENANT_ID" --ignore-not-found >/dev/null
+        kubectl delete rolebinding dch-e2e-secret-reader-access -n "$DCH_TENANT_ID" --ignore-not-found >/dev/null
+        kubectl create rolebinding dch-e2e-secret-reader-access \
+            -n "$DCH_TENANT_ID" \
+            --clusterrole=dch-read-write \
+            --serviceaccount="${DCH_TENANT_ID}:${E2E_SECRET_READER_SA_NAME}" >/dev/null
+        kubectl create rolebinding dch-e2e-secret-reader-export-secret-rb \
+            -n "$DCH_TENANT_ID" \
+            --clusterrole=dch-secret-export \
+            --serviceaccount="${DCH_TENANT_ID}:${E2E_SECRET_READER_SA_NAME}" \
+            --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+        # The secret-read Role is created later by setup_service_rbac once
+        # the enabled datasource secrets are known; a RoleBinding may safely
+        # reference it before then. The old binding name is removed because
+        # it granted the plain e2e user and would keep the denial test from
+        # passing.
+        kubectl create rolebinding dch-e2e-secret-reader-secret-read-rb \
+            -n "$DCH_TENANT_ID" \
+            --role=dch-e2e-flight-secret-read \
+            --serviceaccount="${DCH_TENANT_ID}:${E2E_SECRET_READER_SA_NAME}" \
             --dry-run=client -o yaml | kubectl apply -f - >/dev/null
     fi
 }
@@ -135,21 +169,21 @@ setup_service_rbac() {
     [[ "$E2E_URI_ENABLED" == "true" ]] && secret_names+=("--resource-name=$URI_SECRET")
 
     if [[ ${#secret_names[@]} -gt 0 ]]; then
-        kubectl create role e2e-flight-secret-read \
+        kubectl create role dch-e2e-flight-secret-read \
             -n "$DCH_TENANT_ID" \
             --verb=get --resource=secrets \
             "${secret_names[@]}" \
             --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
-        kubectl create rolebinding e2e-flight-secret-read-rb \
+        kubectl create rolebinding dch-e2e-flight-secret-read-rb \
             -n "$DCH_TENANT_ID" \
-            --role=e2e-flight-secret-read \
+            --role=dch-e2e-flight-secret-read \
             --serviceaccount="${DCH_SERVICE_NAMESPACE}:${DCH_FLIGHT_SA}" \
             --dry-run=client -o yaml | kubectl apply -f - >/dev/null
     fi
 
     # Grant REST tenant secret access for inline credentials, rollback, readiness, and export.
-    kubectl create rolebinding dch-rest-service-secret-access \
+    kubectl create rolebinding dch-e2e-rest-service-secret-access \
         -n "$DCH_TENANT_ID" \
         --clusterrole=dch-rest-service-secret-access \
         --serviceaccount="${DCH_SERVICE_NAMESPACE}:${DCH_REST_SA}" \
@@ -278,7 +312,7 @@ setup_es_apikey_secret() {
         curl -ksf -u "${DCH_TENANT_ES_USERNAME}:${DCH_TENANT_ES_PASSWORD}" \
         -X POST "${es_scheme}://localhost:9200/_security/api_key" \
         -H "Content-Type: application/json" \
-        -d '{"name":"e2e-test-key"}' 2>/dev/null) || return 0
+        -d '{"name":"dch-e2e-key"}' 2>/dev/null) || return 0
 
     local encoded_api_key
     encoded_api_key=$(echo "$api_key_json" | python3 -c "import sys,json; print(json.load(sys.stdin)['encoded'])" 2>/dev/null) || return 0
@@ -431,6 +465,9 @@ generate_tokens() {
     if [[ -z "${DCH_AUTH_TOKEN:-}" ]]; then
         DCH_AUTH_TOKEN=$(kubectl create token "$E2E_SA_NAME" -n "$DCH_TENANT_ID" "${token_args[@]}")
     fi
+    if [[ -z "${DCH_SECRET_READER_AUTH_TOKEN:-}" ]]; then
+        DCH_SECRET_READER_AUTH_TOKEN=$(kubectl create token "$E2E_SECRET_READER_SA_NAME" -n "$DCH_TENANT_ID" "${token_args[@]}")
+    fi
     if [[ -z "${DCH_DENIED_AUTH_TOKEN:-}" ]]; then
         DCH_DENIED_AUTH_TOKEN=$(kubectl create token "$E2E_DENIED_SA_NAME" -n "$DCH_TENANT_ID" "${token_args[@]}")
     fi
@@ -446,6 +483,7 @@ DCH_GATEWAY_ENDPOINT=${DCH_GATEWAY_ENDPOINT}
 DCH_TENANT_ID=${DCH_TENANT_ID}
 DCH_NO_ACCESS_NAMESPACE=${DCH_NO_ACCESS_NAMESPACE}
 DCH_AUTH_TOKEN=${DCH_AUTH_TOKEN}
+DCH_SECRET_READER_AUTH_TOKEN=${DCH_SECRET_READER_AUTH_TOKEN}
 DCH_DENIED_AUTH_TOKEN=${DCH_DENIED_AUTH_TOKEN}
 DCH_INSECURE=${DCH_INSECURE}
 DCH_GATEWAY_AUTH_REQUIRED=${DCH_GATEWAY_AUTH_REQUIRED}
@@ -460,44 +498,47 @@ EOF
     [[ -n "${DCH_REST_METRICS_URL:-}" ]] && \
         echo "DCH_REST_METRICS_URL=${DCH_REST_METRICS_URL}" >> "$ENV_FILE"
 
+    [[ -n "${DCH_JAEGER_QUERY_URL:-}" ]] && \
+        echo "DCH_JAEGER_QUERY_URL=${DCH_JAEGER_QUERY_URL}" >> "$ENV_FILE"
+
     if [[ "$E2E_S3_ENABLED" == "true" ]]; then
         cat >> "$ENV_FILE" <<EOF
 DCH_S3_SECRET=${S3_SECRET}
-DCH_S3_CSV_QUERY=datasets/dch-test-prompts.csv
-DCH_S3_PARQUET_QUERY=datasets/dch-test-prompts.parquet
-DCH_S3_JSONL_QUERY=datasets/dch-test-prompts.jsonl
-DCH_S3_JSON_QUERY=datasets/dch-test-prompts.json
-DCH_S3_BINARY_PATH=datasets/dch-test-binary.bin
+DCH_S3_CSV_QUERY=datasets/dch-e2e-prompts.csv
+DCH_S3_PARQUET_QUERY=datasets/dch-e2e-prompts.parquet
+DCH_S3_JSONL_QUERY=datasets/dch-e2e-prompts.jsonl
+DCH_S3_JSON_QUERY=datasets/dch-e2e-prompts.json
+DCH_S3_BINARY_PATH=datasets/dch-e2e-binary.bin
 EOF
     fi
 
     if [[ "$E2E_MILVUS_ENABLED" == "true" ]]; then
         cat >> "$ENV_FILE" <<'MILVUS_EOF'
-DCH_MILVUS_SECRET=e2e-milvus-creds
+DCH_MILVUS_SECRET=dch-e2e-milvus-creds
 MILVUS_EOF
     fi
 
     if [[ "$E2E_ES_BASIC_ENABLED" == "true" ]]; then
         cat >> "$ENV_FILE" <<'ES_EOF'
-DCH_ES_SECRET=e2e-es-basic-creds
+DCH_ES_SECRET=dch-e2e-es-basic-creds
 ES_EOF
     fi
 
     if [[ "$E2E_ES_APIKEY_ENABLED" == "true" ]]; then
         cat >> "$ENV_FILE" <<'ES_APIKEY_EOF'
-DCH_ES_APIKEY_SECRET=e2e-es-apikey-creds
+DCH_ES_APIKEY_SECRET=dch-e2e-es-apikey-creds
 ES_APIKEY_EOF
     fi
 
     if [[ "$E2E_NEO4J_ENABLED" == "true" ]]; then
         cat >> "$ENV_FILE" <<'NEO4J_EOF'
-DCH_NEO4J_SECRET=e2e-neo4j-creds
+DCH_NEO4J_SECRET=dch-e2e-neo4j-creds
 NEO4J_EOF
     fi
 
     if [[ "$E2E_URI_ENABLED" == "true" ]]; then
         cat >> "$ENV_FILE" <<'URI_EOF'
-DCH_URI_SECRET=e2e-uri-creds
+DCH_URI_SECRET=dch-e2e-uri-creds
 URI_EOF
     fi
 }

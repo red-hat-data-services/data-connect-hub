@@ -33,6 +33,12 @@ spec:
             - --ignore-paths=/health
             - --tls-cert-file=/etc/tls/private/tls.crt
             - --tls-private-key-file=/etc/tls/private/tls.key
+            # x-remote-user gives the service a username for authentications
+            # that carry no forwardable token. The proxy also injects
+            # x-remote-groups as a delimiter-joined string; the service never
+            # parses it because group names may contain the separator, so no
+            # separator is configured here.
+            - --auth-header-fields-enabled
             - --logtostderr=true
           ports:
             - name: https
@@ -117,13 +123,15 @@ spec:
           readinessProbe:
             httpGet:
               path: /health
-              port: 8080
+              port: 8443
+              scheme: HTTPS
             initialDelaySeconds: 3
             periodSeconds: 10
           livenessProbe:
             httpGet:
               path: /health
-              port: 8080
+              port: 8443
+              scheme: HTTPS
             initialDelaySeconds: 5
             periodSeconds: 15
       volumes:

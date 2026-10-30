@@ -48,6 +48,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	dchv1alpha1 "github.com/opendatahub-io/data-connect-hub/dc-controller/api/dataconnecthub/v1alpha1"
+	platformtls "github.com/opendatahub-io/odh-platform-utilities/framework/tls"
 )
 
 const (
@@ -123,6 +124,7 @@ type DataConnectServiceReconciler struct {
 	RestImage           string
 	FlightImage         string
 	KubeRbacProxyImage  string
+	ControllerNamespace string
 	FlightServiceClient FlightServiceClient
 }
 
@@ -405,14 +407,27 @@ func (r *DataConnectServiceReconciler) reconcileManifests(
 		RelatedImageRestService:   r.RestImage,
 		RelatedImageFlightService: r.FlightImage,
 		RelatedImageKubeRbacProxy: r.KubeRbacProxyImage,
+		"GATEWAY_NAME":            gw.Name,
+		"GATEWAY_NAMESPACE":       gw.Namespace,
+		"OPERAND_NAMESPACE":       cr.Namespace,
 	}
-	resources, err := renderKustomization(r.ManifestsPath, manifestPath, patches, nil, paramsEnvOverrides)
+	if r.ControllerNamespace != "" {
+		paramsEnvOverrides["CONTROLLER_NAMESPACE"] = r.ControllerNamespace
+	}
+	resources, err := renderKustomization(r.ManifestsPath, manifestPath, patches, paramsEnvOverrides)
 	if err != nil {
 		return fmt.Errorf("rendering manifests: %w", err)
 	}
 
 	resources = renderFlightService(resources, cr.Name)
 	flightInstanceName := flightServiceResourceName(cr.Name)
+
+	tlsProfile, err := platformtls.LoadWithAdherence(ctx, r.Client)
+	if err != nil {
+		logf.FromContext(ctx).Error(err, "failed to resolve cluster TLS profile for kube-rbac-proxy")
+		return fmt.Errorf("resolving cluster TLS profile for kube-rbac-proxy: %w", err)
+	}
+	setKubeRbacProxyTLSOpts(ctx, resources, tlsProfile.Spec)
 
 	if err := setConfigMapGlobalNamespace(resources, cr.Namespace); err != nil {
 		return fmt.Errorf("setting config namespace: %w", err)
@@ -422,6 +437,9 @@ func (r *DataConnectServiceReconciler) reconcileManifests(
 	}
 	if err := setConfigMapFlightServiceAddress(resources, cr.Namespace, flightInstanceName); err != nil {
 		return fmt.Errorf("setting flight service address: %w", err)
+	}
+	if err := setConfigMapFlightTLSProfile(ctx, resources, flightInstanceName, tlsProfile.Spec); err != nil {
+		return fmt.Errorf("setting flight TLS profile: %w", err)
 	}
 	if cr.Spec.FlightService != nil {
 		if err := setConfigMapFlightConnectorSettings(resources, flightInstanceName, &cr.Spec.FlightService.ServiceOverrides); err != nil {
@@ -569,9 +587,11 @@ func (r *DataConnectServiceReconciler) ensureInitDataConnectionTypes(ctx context
 
 type connectionTypeFile struct {
 	Name              string                   `json:"name"`
+	Label             string                   `json:"label"`
 	Provider          string                   `json:"provider"`
 	Description       string                   `json:"description"`
 	CredentialsFields []connectionTypeFieldDef `json:"credentials_fields"`
+	Tags              []string                 `json:"tags"`
 }
 
 type connectionTypeFieldDef struct {
@@ -603,6 +623,10 @@ func (f *connectionTypeFile) toIDCTSpec() dchv1alpha1.InitDataConnectionTypeSpec
 		Name:              f.Name,
 		Provider:          f.Provider,
 		CredentialsFields: fields,
+		Tags:              f.Tags,
+	}
+	if f.Label != "" {
+		spec.Label = &f.Label
 	}
 	if f.Description != "" {
 		spec.Description = &f.Description
