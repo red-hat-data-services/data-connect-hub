@@ -286,14 +286,20 @@ class TestConnectionType:
     def test_flight_ready_from_wrapped_status(self) -> None:
         data = {
             **SAMPLE_CONNECTION_TYPE_WRAPPED_JSON,
-            "status": {"flight_ready": True, "flight_url": "grpc://flight:50051"},
+            "status": {
+                "supported_formats": ["tabular"],
+                "flight_ready": True,
+                "flight_url": "grpc://flight:50051",
+            },
         }
         ct = ConnectionType.model_validate(data)
+        assert ct.status.supported_formats == ["tabular"]
         assert ct.status.flight_ready is True
         assert ct.status.flight_url == "grpc://flight:50051"
 
     def test_status_defaults(self) -> None:
         ct = ConnectionType.model_validate(SAMPLE_CONNECTION_TYPE_WRAPPED_JSON)
+        assert ct.status.supported_formats == []
         assert ct.status.flight_ready is False
         assert ct.status.flight_url is None
 
@@ -323,3 +329,87 @@ class TestConnectionType:
         assert len(field.enum_values) == 2
         assert field.enum_values[0] == EnumValue(value="us-east-1", label="US East")
         assert field.enum_values[1].value == "eu-west-1"
+        assert field.sensitive is False
+        assert field.multiple is False
+
+    def test_credentials_field_multiple(self) -> None:
+        ct = ConnectionType.model_validate(
+            {
+                "id": "ct-oci",
+                "name": "oci-v1",
+                "provider": "oci-v1",
+                "credentials_fields": [
+                    {
+                        "name": "ACCESS_TYPE",
+                        "label": "Access type",
+                        "required": False,
+                        "type": "enum",
+                        "multiple": True,
+                        "enum_values": [
+                            {"value": "Push", "label": "Push secret"},
+                            {"value": "Pull", "label": "Pull secret"},
+                        ],
+                    }
+                ],
+            }
+        )
+        assert ct.credentials_fields[0].multiple is True
+
+    def test_credentials_field_sensitive(self) -> None:
+        ct = ConnectionType.model_validate(
+            {
+                "id": "ct-pg",
+                "name": "Postgres",
+                "provider": "postgres",
+                "credentials_fields": [
+                    {"name": "URI", "label": "URI", "required": True, "type": "string", "sensitive": True},
+                ],
+            }
+        )
+        assert ct.credentials_fields[0].sensitive is True
+
+    def test_tags_present(self) -> None:
+        data = {
+            **SAMPLE_CONNECTION_TYPE_JSON,
+            "tags": ["domain: database", "engine: postgresql"],
+        }
+        ct = ConnectionType.model_validate(data)
+        assert ct.tags == ["domain: database", "engine: postgresql"]
+
+    def test_tags_absent(self) -> None:
+        ct = ConnectionType.model_validate(SAMPLE_CONNECTION_TYPE_JSON)
+        assert ct.tags is None
+
+    def test_tags_from_wrapped_json(self) -> None:
+        data = {
+            **SAMPLE_CONNECTION_TYPE_WRAPPED_JSON,
+            "resource": {
+                **SAMPLE_CONNECTION_TYPE_WRAPPED_JSON["resource"],
+                "tags": ["domain: database"],
+            },
+        }
+        ct = ConnectionType.model_validate(data)
+        assert ct.tags == ["domain: database"]
+
+    def test_label_present(self) -> None:
+        data = {
+            **SAMPLE_CONNECTION_TYPE_JSON,
+            "label": "PostgreSQL Database",
+        }
+        ct = ConnectionType.model_validate(data)
+        assert ct.label == "PostgreSQL Database"
+
+    def test_label_absent(self) -> None:
+        ct = ConnectionType.model_validate(SAMPLE_CONNECTION_TYPE_JSON)
+        assert ct.label is None
+
+    def test_label_from_wrapped_json(self) -> None:
+        data = {
+            **SAMPLE_CONNECTION_TYPE_WRAPPED_JSON,
+            "resource": {
+                **SAMPLE_CONNECTION_TYPE_WRAPPED_JSON["resource"],
+                "label": "PostgreSQL Database",
+            },
+        }
+        ct = ConnectionType.model_validate(data)
+        assert ct.label == "PostgreSQL Database"

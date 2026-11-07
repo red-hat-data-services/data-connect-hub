@@ -62,6 +62,7 @@ spec:
         args:
           - --leader-elect
           - --health-probe-bind-address=:8081
+          - --zap-encoder=json
         image: controller:latest
         name: manager
         ports:
@@ -69,7 +70,7 @@ spec:
           name: health
           protocol: TCP
         env:
-        - name: APPLICATIONS_NAMESPACE
+        - name: CONTROLLER_NAMESPACE
           valueFrom:
             fieldRef:
               fieldPath: metadata.namespace

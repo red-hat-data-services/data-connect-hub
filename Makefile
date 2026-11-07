@@ -8,6 +8,7 @@ $(error VERSION could not be determined; set VERSION explicitly)
 endif
 IMAGE            ?= data-connection-hub
 CONTAINER_ENGINE ?= $(shell command -v podman 2>/dev/null || command -v docker 2>/dev/null)
+REDOCLY_CLI      ?= docker.io/redocly/cli:2.69.0
 V                ?=
 
 ifneq ($(V),)
@@ -23,6 +24,7 @@ endif
 	oc-setup-flight oc-setup-rest oc-setup-all \
 	oc-build-flight oc-build-rest oc-build-all \
 	sdk-install sdk-test sdk-lint sdk-fmt sdk-typecheck sdk-build sdk-package-check sdk-all \
+	e2e-venv e2e-lint e2e-fmt \
 	setup-hooks help
 
 # -------------------------------------------------------------------
@@ -135,6 +137,7 @@ doc:
 
 audit:
 	cargo audit
+	cargo deny check
 
 check-dco:
 	@bash hack/check-dco.sh
@@ -161,6 +164,7 @@ $(PYTHON_SDK_DIR)/.venv/bin/python3:
 sdk-venv: $(SDK_VENV_PREREQ)
 
 sdk-install: sdk-venv
+	$(SDK_PYTHON) -m pip install --upgrade -r "$(PYTHON_SDK_DIR)/requirements.txt"
 	$(SDK_PYTHON) -m pip install -e "$(PYTHON_SDK_DIR)[flight,dev]"
 
 sdk-test: sdk-venv
@@ -185,6 +189,37 @@ sdk-package-check: sdk-build
 	"$(SDK_PYTHON)" -m twine check "$(PYTHON_SDK_DIR)"/dist/*
 
 sdk-all: sdk-lint sdk-typecheck sdk-test sdk-package-check
+
+# -------------------------------------------------------------------
+# E2E
+# -------------------------------------------------------------------
+
+E2E_DIR := e2e
+
+ifdef VIRTUAL_ENV
+  E2E_PYTHON      := python3
+  E2E_BIN         :=
+  E2E_VENV_PREREQ :=
+else
+  E2E_PYTHON      := $(E2E_DIR)/.venv/bin/python3
+  E2E_BIN         := .venv/bin/
+  E2E_VENV_PREREQ := $(E2E_PYTHON)
+endif
+
+$(E2E_DIR)/.venv/bin/python3:
+	python3 -m venv $(E2E_DIR)/.venv
+
+e2e-venv: $(E2E_VENV_PREREQ)
+
+e2e-lint: e2e-venv
+	$(E2E_PYTHON) -m pip install --quiet "ruff>=0.5"
+	cd $(E2E_DIR) && $(E2E_BIN)ruff check tests/ scenarios/ conftest.py
+	cd $(E2E_DIR) && $(E2E_BIN)ruff format --check tests/ scenarios/ conftest.py
+
+e2e-fmt: e2e-venv
+	$(E2E_PYTHON) -m pip install --quiet "ruff>=0.5"
+	cd $(E2E_DIR) && $(E2E_BIN)ruff format tests/ scenarios/ conftest.py
+	cd $(E2E_DIR) && $(E2E_BIN)ruff check --fix tests/ scenarios/ conftest.py
 
 # -------------------------------------------------------------------
 # OpenAPI docs
@@ -222,7 +257,7 @@ _generate-openapi-docs-container:
 		--pull=newer \
 		-v "$$PWD:/spec:Z" \
 		--entrypoint sh \
-		docker.io/redocly/cli -c ' \
+		$(REDOCLY_CLI) -c ' \
 			echo "1. Bundling external spec to openapi.yaml (with x-internal removed)..." && redocly bundle external@latest --output docs/api/openapi.yaml --remove-unused-components && \
 			echo "2. Bundling external spec to openapi.json (with x-internal removed)..." && redocly bundle external@latest --ext json --output docs/api/openapi.json && \
 			echo "3. Bundling internal spec to openapi-internal.yaml (with x-internal removed)..." && redocly bundle internal@latest --output docs/api/openapi-internal.yaml --remove-unused-components && \
@@ -270,7 +305,7 @@ help:
 	@echo "  lint                 clippy + rustfmt check"
 	@echo "  fmt                  format all crates"
 	@echo "  doc                  rustdoc with warnings"
-	@echo "  audit                cargo audit"
+	@echo "  audit                cargo audit + cargo deny check"
 	@echo ""
 	@echo "Container:"
 	@echo "  container-flight     build flight-service image"
@@ -296,3 +331,7 @@ help:
 	@echo "  sdk-build            build SDK wheel and source distribution"
 	@echo "  sdk-package-check    build and validate SDK distribution metadata"
 	@echo "  sdk-all              lint + typecheck + test + package check SDK"
+	@echo ""
+	@echo "E2E:"
+	@echo "  e2e-lint             lint and format-check E2E tests"
+	@echo "  e2e-fmt              format and auto-fix E2E tests"

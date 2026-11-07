@@ -7,7 +7,7 @@ use actix_web::{HttpMessage, HttpResponse};
 use super::endpoints::ApiContext;
 use super::errors::EndpointError;
 use super::errors::RestErrorResponse;
-use commons::api::X_TENANT_ID;
+use commons::api::{X_REMOTE_USER, X_TENANT_ID};
 use opentelemetry::propagation::Extractor;
 use tracing::Instrument;
 use tracing::field::Empty;
@@ -53,6 +53,7 @@ pub async fn trace_request(
         http.request.method = %method,
         http.route = %route,
         http.response.status_code = Empty,
+        request.path = %req.path(),
         url.path = %req.path(),
         tenant.id = HeaderExtractor(req.headers()).get(X_TENANT_ID).unwrap_or_default(),
     );
@@ -114,7 +115,17 @@ pub async fn validate_headers(
         },
     };
 
-    req.extensions_mut().insert(ApiContext { tenant_id });
+    // kube-rbac-proxy authenticates the caller and strips the Authorization
+    // header before forwarding, so no bearer token ever reaches the service:
+    // identity arrives solely as the proxy-injected x-remote-user. Group
+    // membership is deliberately not taken from x-remote-groups: the proxy
+    // renders that header by joining group names with a delimiter, so a name
+    // containing the separator could not be told apart from two names, and
+    // the identity is reviewed by username alone.
+    let identity =
+        crate::auth::resolve_identity(req.headers().get(X_REMOTE_USER).and_then(|value| value.to_str().ok()));
+
+    req.extensions_mut().insert(ApiContext { tenant_id, identity });
 
     next.call(req).await.map(ServiceResponse::map_into_left_body)
 }

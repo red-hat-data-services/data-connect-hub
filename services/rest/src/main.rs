@@ -11,7 +11,7 @@ use crate::state::ApiService;
 use crate::utils::ServerConfig;
 use anyhow::Result;
 use commons::api::storage::MetaStore;
-use commons::utils::{TraceConfig, init_tracing, log_trace_exporter};
+use commons::utils::{TraceConfig, init_tracing_json, log_trace_exporter};
 use config::{Config, File};
 use kube_utils::secrets::KubeSecretStore;
 use pg_meta_store::store::PgMetaStore;
@@ -21,6 +21,7 @@ use url::Url;
 /// SERVICE_NAME identifies this service in exported traces.
 const SERVICE_NAME: &str = "dch-rest-service";
 
+mod auth;
 mod clients;
 mod rest;
 #[allow(unused)]
@@ -190,7 +191,7 @@ async fn main() -> Result<()> {
     let config = Arc::new(load_config(args.config.clone(), args.secret_config.clone())?);
 
     let trace = TraceConfig::from_env();
-    let tracer_provider = init_tracing(SERVICE_NAME, args.json_logs, &trace)?;
+    let tracer_provider = init_tracing_json(SERVICE_NAME, args.json_logs, &trace)?;
 
     tracing::info!("Starting DataConnectorHub API service");
     log_config_source(&args.config, "--config", true);
@@ -210,13 +211,28 @@ async fn main() -> Result<()> {
 
     let flight_ca_cert = read_ca_cert(&config).await?;
 
-    let service = Arc::new(ApiService::new(
+    let mut service = ApiService::new(
         meta_store,
         Arc::new(secret_store),
         flight_ca_cert,
         config.server.sa_token_file.clone(),
         config.global_connection_types.tenant_id.clone(),
-    ));
+    );
+    if config.auth.enabled {
+        tracing::info!("Auth enabled (cache TTL: {}s)", config.auth.cache_ttl_secs);
+        let auth_client = kube_utils::auth::KubeAuthClient::try_default(
+            std::time::Duration::from_secs(config.auth.cache_ttl_secs),
+            // kube-rbac-proxy strips the Authorization header, so the
+            // rest-service never reviews request tokens and configures no
+            // TokenReview audiences.
+            Vec::new(),
+        )
+        .await?;
+        service = service.with_authorizer(std::sync::Arc::new(auth_client));
+    } else {
+        tracing::warn!("Auth is DISABLED — secret references are not checked against the requester");
+    }
+    let service = Arc::new(service);
 
     let metrics_enabled = config.metrics.enabled;
     if metrics_enabled {
