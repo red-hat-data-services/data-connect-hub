@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -33,8 +34,12 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -870,6 +875,36 @@ var _ = Describe("DataConnectService Controller", func() {
 		})
 	})
 })
+
+func TestUpdateStatusPropagatesConflictForRateLimitedRetry(t *testing.T) {
+	cr := &dchv1alpha1.DataConnectService{ObjectMeta: metav1.ObjectMeta{Name: "conflict-test", Namespace: "default"}}
+	scheme := runtime.NewScheme()
+	if err := dchv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&dchv1alpha1.DataConnectService{}).
+		WithObjects(cr).
+		WithInterceptorFuncs(interceptor.Funcs{
+			SubResourceUpdate: func(_ context.Context, _ client.Client, subResourceName string, _ client.Object, _ ...client.SubResourceUpdateOption) error {
+				if subResourceName != "status" {
+					t.Fatalf("subresource = %q, want status", subResourceName)
+				}
+				return errors.NewConflict(schema.GroupResource{
+					Group: dchv1alpha1.GroupVersion.Group, Resource: "dataconnectservices",
+				}, cr.Name, nil)
+			},
+		}).
+		Build()
+	r := &DataConnectServiceReconciler{Client: k8sClient}
+	_, err := r.updateStatus(context.Background(), reconcile.Request{
+		NamespacedName: types.NamespacedName{Name: cr.Name, Namespace: cr.Namespace},
+	}, &platformConfig{}, conditionTypeReady, func(*dchv1alpha1.DataConnectService) {})
+	if !errors.IsConflict(err) {
+		t.Fatalf("updateStatus() error = %v, want conflict", err)
+	}
+}
 
 const (
 	testOTLPEndpoint = "http://otel:4317"

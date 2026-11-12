@@ -331,9 +331,6 @@ func (r *DataConnectServiceReconciler) updateStatus(
 	mutate(&cr)
 
 	if err := r.Status().Update(ctx, &cr); err != nil {
-		if apierrors.IsConflict(err) {
-			return ctrl.Result{Requeue: true}, nil
-		}
 		return ctrl.Result{}, err
 	}
 
