@@ -19,6 +19,7 @@ import (
 )
 
 const usableECDHECipher = "ECDHE-ECDSA-AES128-GCM-SHA256"
+const configAPIGroup = "config.openshift.io"
 
 func TestResolveRejectsEmptyCiphersUnderStrictAndUnknownAdherence(t *testing.T) {
 	profile := &configv1.TLSSecurityProfile{Type: configv1.TLSProfileCustomType, Custom: &configv1.CustomTLSProfile{
@@ -115,13 +116,24 @@ func TestResolveRejectsInvalidStrictProfile(t *testing.T) {
 
 func TestResolveFallbacksWhenConfigAPIIsMissing(t *testing.T) {
 	err := &meta.NoResourceMatchError{PartialResource: schema.GroupVersionResource{
-		Group: "config.openshift.io", Version: "v1", Resource: apiServerResource,
+		Group: configAPIGroup, Version: "v1", Resource: apiServerResource,
 	}}
 	result, resolveErr := resolveProfile(context.Background(), failingTLSReader{err: err})
 	if resolveErr != nil {
 		t.Fatalf("resolveProfile() returned an error: %v", resolveErr)
 	}
 	assertFallback(t, result, false)
+}
+
+func TestResolveFallbacksAndWatchesWhenAPIServerObjectIsMissing(t *testing.T) {
+	err := apierrors.NewNotFound(schema.GroupResource{
+		Group: configAPIGroup, Resource: apiServerResource,
+	}, apiServerName)
+	result, resolveErr := resolveProfile(context.Background(), failingTLSReader{err: err})
+	if resolveErr != nil {
+		t.Fatalf("resolveProfile() returned an error: %v", resolveErr)
+	}
+	assertFallback(t, result, true)
 }
 
 func TestResolveFallbacksAndWatchesAfterTransientReadError(t *testing.T) {
@@ -142,7 +154,7 @@ func TestResolveFallbacksAndWatchesAfterTransientReadError(t *testing.T) {
 
 func TestResolveReturnsDeniedReadErrors(t *testing.T) {
 	for _, err := range []error{
-		apierrors.NewForbidden(schema.GroupResource{Group: "config.openshift.io", Resource: "apiservers"}, "cluster", errors.New("denied")),
+		apierrors.NewForbidden(schema.GroupResource{Group: configAPIGroup, Resource: "apiservers"}, "cluster", errors.New("denied")),
 		apierrors.NewUnauthorized("denied"),
 	} {
 		t.Run(err.Error(), func(t *testing.T) {
