@@ -20,6 +20,7 @@ import (
 	"context"
 	"path/filepath"
 	"slices"
+	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -50,8 +51,10 @@ var _ = Describe("DataConnectService Controller", func() {
 		testFlightImage = "quay.io/opendatahub/odh-data-connect-hub-flight:odh-stable"
 
 		// Kustomize adds this prefix to all resource names.
-		np                 = "dch-"
-		flightResourceName = np + resourceName + "-flight"
+		np                  = "dch-"
+		flightResourceName  = np + resourceName + "-flight"
+		controllerNamespace = "controller-ns"
+		rhoaiGatewayNS      = "openshift-ingress"
 	)
 
 	ctx := context.Background()
@@ -62,12 +65,40 @@ var _ = Describe("DataConnectService Controller", func() {
 
 	reconciler := func() *DataConnectServiceReconciler {
 		return &DataConnectServiceReconciler{
-			Client:             k8sClient,
-			Scheme:             k8sClient.Scheme(),
-			ManifestsPath:      manifestsPath,
-			RestImage:          testRestImage,
-			FlightImage:        testFlightImage,
-			KubeRbacProxyImage: "quay.io/opendatahub/odh-kube-rbac-proxy:odh-stable",
+			Client:              k8sClient,
+			Scheme:              k8sClient.Scheme(),
+			ManifestsPath:       manifestsPath,
+			RestImage:           testRestImage,
+			FlightImage:         testFlightImage,
+			KubeRbacProxyImage:  "quay.io/opendatahub/odh-kube-rbac-proxy:odh-stable",
+			ControllerNamespace: controllerNamespace,
+		}
+	}
+
+	expectPolicyNamespace := func(name string, ingressIndex int, namespace string) {
+		policy := &networkingv1.NetworkPolicy{}
+		key := types.NamespacedName{Name: name, Namespace: targetNamespace}
+		ExpectWithOffset(1, k8sClient.Get(ctx, key, policy)).To(Succeed())
+		ExpectWithOffset(1, policy.Spec.Ingress[ingressIndex].From[0].NamespaceSelector.MatchLabels).
+			To(HaveKeyWithValue("kubernetes.io/metadata.name", namespace))
+	}
+
+	expectGatewayPolicy := func(gatewayName, gatewayNamespace string) {
+		for _, tc := range []struct {
+			name         string
+			ingressIndex int
+		}{
+			{np + nameRestService, 0},
+			{flightResourceName, 1},
+		} {
+			policy := &networkingv1.NetworkPolicy{}
+			key := types.NamespacedName{Name: tc.name, Namespace: targetNamespace}
+			ExpectWithOffset(1, k8sClient.Get(ctx, key, policy)).To(Succeed())
+			peer := policy.Spec.Ingress[tc.ingressIndex].From[0]
+			ExpectWithOffset(1, peer.NamespaceSelector.MatchLabels).
+				To(HaveKeyWithValue("kubernetes.io/metadata.name", gatewayNamespace))
+			ExpectWithOffset(1, peer.PodSelector.MatchLabels).
+				To(HaveKeyWithValue("gateway.networking.k8s.io/gateway-name", gatewayName))
 		}
 	}
 
@@ -87,6 +118,7 @@ var _ = Describe("DataConnectService Controller", func() {
 			_ = k8sClient.Delete(ctx, &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: targetNamespace}})
 		}
 		for _, name := range []string{
+			np + "params",
 			np + nameRestService + "-config",
 			flightResourceName + "-config",
 			np + nameRestService + "-kube-rbac-proxy-config",
@@ -291,6 +323,57 @@ var _ = Describe("DataConnectService Controller", func() {
 			deploy := &appsv1.Deployment{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: np + nameRestService, Namespace: targetNamespace}, deploy)).To(Succeed())
 			Expect(deploy.Labels).To(HaveKeyWithValue(labelManagedBy, managedByDCHService))
+		})
+
+		It("should use the default gateway name and namespace in both policies", func() {
+			_, err := reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: crKey})
+			Expect(err).NotTo(HaveOccurred())
+			expectGatewayPolicy(defaultGatewayName, defaultGatewayNamespace)
+		})
+
+		It("should use explicit source namespaces for service ingress", func() {
+			_, err := reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: crKey})
+			Expect(err).NotTo(HaveOccurred())
+			expectPolicyNamespace(np+nameRestService, 1, controllerNamespace)
+			expectPolicyNamespace(flightResourceName, 0, targetNamespace)
+		})
+
+		It("should project Intermediate TLS defaults onto kube-rbac-proxy without the OpenShift config API", func() {
+			// The envtest cluster is vanilla Kubernetes: the config.openshift.io
+			// API is genuinely unavailable, so the profile resolution falls
+			// back to Intermediate and the caller must still project hardened
+			// TLS options onto the applied proxy deployment.
+			reconcileUntilReady()
+
+			deploy := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: np + nameRestService, Namespace: targetNamespace}, deploy)).To(Succeed())
+			proxy := findContainer(deploy, nameKubeRbacProxy)
+			Expect(proxy).NotTo(BeNil())
+
+			Expect(slices.Contains(proxy.Args, "--tls-min-version=VersionTLS12")).To(BeTrue(),
+				"expected the Intermediate minimum on kube-rbac-proxy without the OpenShift config API")
+			Expect(slices.ContainsFunc(proxy.Args, func(arg string) bool {
+				return strings.HasPrefix(arg, "--tls-cipher-suites=TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256")
+			})).To(BeTrue(), "expected Intermediate cipher suites on kube-rbac-proxy")
+		})
+
+		It("should project the Intermediate TLS profile onto the flight-service configmap without the OpenShift config API", func() {
+			// Caller-level fallback pin for the Flight listener: the envtest
+			// cluster is vanilla Kubernetes, so profile resolution falls back
+			// to Intermediate and the flight configmap must still carry the
+			// projected policy for the rustls acceptor to enforce.
+			reconcileUntilReady()
+
+			cm := &corev1.ConfigMap{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: flightResourceName + "-config", Namespace: targetNamespace}, cm)).To(Succeed())
+			var flightConfigTOML map[string]any
+			Expect(toml.Unmarshal([]byte(cm.Data["config.toml"]), &flightConfigTOML)).To(Succeed())
+			tls, ok := flightConfigTOML["tls"].(map[string]any)
+			Expect(ok).To(BeTrue(), "expected [tls] section in flight config")
+			Expect(tls["min_version"]).To(Equal("VersionTLS12"))
+			ciphers, ok := tls["ciphers"].([]any)
+			Expect(ok).To(BeTrue(), "expected projected cipher suites in flight config")
+			Expect(ciphers).To(ContainElement("TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256"))
 		})
 	})
 
@@ -729,7 +812,7 @@ var _ = Describe("DataConnectService Controller", func() {
 					"distribution.name":    "Standalone",
 					"distribution.version": "0.0.0",
 					"gateway.name":         "custom-gateway",
-					"gateway.namespace":    "custom-ns",
+					"gateway.namespace":    rhoaiGatewayNS,
 				},
 			}
 			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
@@ -752,7 +835,17 @@ var _ = Describe("DataConnectService Controller", func() {
 			Expect(k8sClient.Get(ctx, crKey, cr)).To(Succeed())
 			Expect(cr.Status.Gateway).NotTo(BeNil())
 			Expect(cr.Status.Gateway.Name).To(Equal("custom-gateway"))
-			Expect(cr.Status.Gateway.Namespace).To(Equal("custom-ns"))
+			Expect(cr.Status.Gateway.Namespace).To(Equal(rhoaiGatewayNS))
+			expectGatewayPolicy("custom-gateway", rhoaiGatewayNS)
+
+			cm := &corev1.ConfigMap{}
+			key := types.NamespacedName{Name: platformConfigName, Namespace: targetNamespace}
+			Expect(k8sClient.Get(ctx, key, cm)).To(Succeed())
+			cm.Data["gateway.namespace"] = "updated-ns"
+			Expect(k8sClient.Update(ctx, cm)).To(Succeed())
+			_, err := reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: crKey})
+			Expect(err).NotTo(HaveOccurred())
+			expectGatewayPolicy("custom-gateway", "updated-ns")
 		})
 
 		It("should prefer spec.gateway over ConfigMap gateway", func() {
@@ -773,6 +866,7 @@ var _ = Describe("DataConnectService Controller", func() {
 			Expect(cr.Status.Gateway).NotTo(BeNil())
 			Expect(cr.Status.Gateway.Name).To(Equal("spec-gateway"))
 			Expect(cr.Status.Gateway.Namespace).To(Equal("spec-ns"))
+			expectGatewayPolicy("spec-gateway", "spec-ns")
 		})
 	})
 })
@@ -961,6 +1055,105 @@ var _ = Describe("reconcileTraceEnv", func() {
 
 		Expect(reconcileTraceEnv([]*unstructured.Unstructured{deploy}, trace, nameRestService)).To(BeTrue())
 		Expect(envOf(deploy, nameRestService)).NotTo(BeEmpty())
+		Expect(envOf(deploy, nameKubeRbacProxy)).To(BeEmpty())
+	})
+})
+
+var _ = Describe("auditEnv", func() {
+	It("returns nil when audit is unset", func() {
+		Expect(auditEnv(nil)).To(BeNil())
+	})
+
+	It("returns nil when enabled is unset", func() {
+		Expect(auditEnv(&dchv1alpha1.Audit{})).To(BeNil())
+	})
+
+	It("returns nil when disabled", func() {
+		Expect(auditEnv(&dchv1alpha1.Audit{Enabled: ptr.To(false)})).To(BeNil())
+	})
+
+	It("returns AUDIT_ENABLED=true when enabled", func() {
+		Expect(auditEnv(&dchv1alpha1.Audit{Enabled: ptr.To(true)})).To(Equal([]corev1.EnvVar{
+			{Name: envAuditEnabled, Value: valueTrue},
+		}))
+	})
+})
+
+var _ = Describe("reconcileAuditEnv", func() {
+	It("sets AUDIT_ENABLED=true on both service containers when enabled", func() {
+		deploy := newDeployment(
+			corev1.Container{Name: nameRestServiceContainer},
+			corev1.Container{Name: nameFlightServiceContainer},
+		)
+		audit := &dchv1alpha1.Audit{Enabled: ptr.To(true)}
+
+		Expect(reconcileAuditEnv([]*unstructured.Unstructured{deploy}, audit, nameRestServiceContainer, nameFlightServiceContainer)).To(BeTrue())
+		Expect(envOf(deploy, nameRestServiceContainer)).To(Equal([]corev1.EnvVar{{Name: envAuditEnabled, Value: valueTrue}}))
+		Expect(envOf(deploy, nameFlightServiceContainer)).To(Equal([]corev1.EnvVar{{Name: envAuditEnabled, Value: valueTrue}}))
+	})
+
+	It("leaves AUDIT_ENABLED unset when audit is nil", func() {
+		deploy := newDeployment(corev1.Container{Name: nameRestServiceContainer})
+
+		Expect(reconcileAuditEnv([]*unstructured.Unstructured{deploy}, nil, nameRestServiceContainer)).To(BeFalse())
+		Expect(envOf(deploy, nameRestServiceContainer)).To(BeEmpty())
+	})
+
+	It("leaves AUDIT_ENABLED unset when disabled", func() {
+		deploy := newDeployment(corev1.Container{Name: nameRestServiceContainer})
+		audit := &dchv1alpha1.Audit{Enabled: ptr.To(false)}
+
+		Expect(reconcileAuditEnv([]*unstructured.Unstructured{deploy}, audit, nameRestServiceContainer)).To(BeFalse())
+		Expect(envOf(deploy, nameRestServiceContainer)).To(BeEmpty())
+	})
+
+	It("removes a stale AUDIT_ENABLED=true when toggled back to disabled", func() {
+		existing := corev1.EnvVar{Name: testEnvRustLog, Value: "warn"}
+		stale := corev1.EnvVar{Name: envAuditEnabled, Value: valueTrue}
+		deploy := newDeployment(corev1.Container{
+			Name: nameRestServiceContainer,
+			Env:  []corev1.EnvVar{existing, stale},
+		})
+		audit := &dchv1alpha1.Audit{Enabled: ptr.To(false)}
+
+		Expect(reconcileAuditEnv([]*unstructured.Unstructured{deploy}, audit, nameRestServiceContainer)).To(BeTrue())
+		Expect(envOf(deploy, nameRestServiceContainer)).To(Equal([]corev1.EnvVar{existing}))
+	})
+
+	It("updates an existing AUDIT_ENABLED rather than duplicating it", func() {
+		deploy := newDeployment(corev1.Container{Name: nameRestServiceContainer})
+		enabled := &dchv1alpha1.Audit{Enabled: ptr.To(true)}
+		Expect(reconcileAuditEnv([]*unstructured.Unstructured{deploy}, enabled, nameRestServiceContainer)).To(BeTrue())
+
+		disabled := &dchv1alpha1.Audit{Enabled: ptr.To(false)}
+		Expect(reconcileAuditEnv([]*unstructured.Unstructured{deploy}, disabled, nameRestServiceContainer)).To(BeTrue())
+		Expect(envOf(deploy, nameRestServiceContainer)).To(BeEmpty())
+	})
+
+	It("preserves non-audit env vars", func() {
+		existing := []corev1.EnvVar{
+			{Name: testEnvRustLog, Value: "debug"},
+			{Name: envOTLPEndpoint, Value: testOTLPEndpoint},
+		}
+		deploy := newDeployment(corev1.Container{Name: nameRestServiceContainer, Env: existing})
+		audit := &dchv1alpha1.Audit{Enabled: ptr.To(true)}
+
+		Expect(reconcileAuditEnv([]*unstructured.Unstructured{deploy}, audit, nameRestServiceContainer)).To(BeTrue())
+		env := envOf(deploy, nameRestServiceContainer)
+		Expect(env).To(ContainElements(existing))
+		Expect(env).To(ContainElement(corev1.EnvVar{Name: envAuditEnabled, Value: valueTrue}))
+		Expect(env).To(HaveLen(3))
+	})
+
+	It("only touches named containers", func() {
+		deploy := newDeployment(
+			corev1.Container{Name: nameRestServiceContainer},
+			corev1.Container{Name: nameKubeRbacProxy},
+		)
+		audit := &dchv1alpha1.Audit{Enabled: ptr.To(true)}
+
+		Expect(reconcileAuditEnv([]*unstructured.Unstructured{deploy}, audit, nameRestServiceContainer)).To(BeTrue())
+		Expect(envOf(deploy, nameRestServiceContainer)).NotTo(BeEmpty())
 		Expect(envOf(deploy, nameKubeRbacProxy)).To(BeEmpty())
 	})
 })

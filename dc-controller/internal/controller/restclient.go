@@ -82,10 +82,12 @@ type FlightServiceStatus struct {
 
 // ConnectionType mirrors the Rust DataConnectionType JSON structure.
 type ConnectionType struct {
-	Name              string  `json:"name"`
-	Provider          string  `json:"provider"`
-	Description       *string `json:"description,omitempty"`
-	CredentialsFields []Field `json:"credentials_fields"`
+	Name              string   `json:"name"`
+	Label             *string  `json:"label,omitempty"`
+	Provider          string   `json:"provider"`
+	Description       *string  `json:"description,omitempty"`
+	CredentialsFields []Field  `json:"credentials_fields"`
+	Tags              []string `json:"tags,omitempty"`
 }
 
 // Field mirrors the Rust Field JSON structure.
@@ -97,6 +99,8 @@ type Field struct {
 	Type         string      `json:"type"`
 	EnumValues   []EnumValue `json:"enum_values,omitempty"`
 	DefaultValue *string     `json:"default_value,omitempty"`
+	Sensitive    bool        `json:"sensitive"`
+	Multiple     bool        `json:"multiple"`
 }
 
 // EnumValue mirrors the Rust EnumValue JSON structure.
@@ -108,6 +112,7 @@ type EnumValue struct {
 // Connection mirrors the Rust DataConnection JSON structure.
 type Connection struct {
 	Name                 string            `json:"name"`
+	Description          *string           `json:"description,omitempty"`
 	DataConnectionTypeID string            `json:"data_connection_type_id"`
 	Format               string            `json:"format"`
 	CredentialsRef       *CredentialsRef   `json:"credentials_ref"`

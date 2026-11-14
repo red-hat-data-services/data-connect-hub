@@ -48,6 +48,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	dchv1alpha1 "github.com/opendatahub-io/data-connect-hub/dc-controller/api/dataconnecthub/v1alpha1"
+	platformtls "github.com/opendatahub-io/odh-platform-utilities/framework/tls"
 )
 
 const (
@@ -59,7 +60,18 @@ const (
 	conditionTypeDegraded              = "Degraded"
 	conditionTypeGRPCGatewaySupported  = "GRPCGatewaySupported"
 
-	annotationHTTP2Enable = "ingress.operator.openshift.io/default-enable-http2"
+	// addressTypeHostname is the only address type the CR status publishes;
+	// see the Addresses type in the API.
+	addressTypeHostname = "hostname"
+
+	annotationHTTP2Enable        = "ingress.operator.openshift.io/default-enable-http2"
+	openshiftConfigGroup         = "config.openshift.io"
+	gatewayAPIGroup              = "gateway.networking.k8s.io"
+	gatewayKind                  = "Gateway"
+	routeTerminationReencrypt    = "reencrypt"
+	reasonRouteCertNotConfigured = "GatewayRouteCertificateNotConfigured"
+	reasonRouteHTTP2Configured   = "GatewayRouteHTTP2Configured"
+	reasonHTTP2Disabled          = "HTTP2Disabled"
 
 	requeueWaitingForReady = 10 * time.Second
 	requeueOnError         = 30 * time.Second
@@ -78,6 +90,9 @@ const (
 	envOTLPEndpoint    = "OTEL_EXPORTER_OTLP_ENDPOINT"
 	envOTLPInsecure    = "OTEL_EXPORTER_OTLP_INSECURE"
 	envOTLPCertificate = "OTEL_EXPORTER_OTLP_CERTIFICATE"
+
+	// envAuditEnabled carries spec.audit.enabled to the service containers.
+	envAuditEnabled = "AUDIT_ENABLED"
 
 	kindDeployment         = "Deployment"
 	kindConfigMap          = "ConfigMap"
@@ -123,6 +138,7 @@ type DataConnectServiceReconciler struct {
 	RestImage           string
 	FlightImage         string
 	KubeRbacProxyImage  string
+	ControllerNamespace string
 	FlightServiceClient FlightServiceClient
 }
 
@@ -185,14 +201,23 @@ func (r *DataConnectServiceReconciler) readPlatformConfig(ctx context.Context, n
 // +kubebuilder:rbac:groups=dataconnecthub.opendatahub.io,resources=dataconnectservices,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=dataconnecthub.opendatahub.io,resources=dataconnectservices/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=dataconnecthub.opendatahub.io,resources=dataconnectservices/finalizers,verbs=update
-// +kubebuilder:rbac:groups=dataconnecthub.opendatahub.io,resources=data-connections;data-connection-types;flight-services,verbs=get;list;watch;create;update;patch;delete;post;put
-// +kubebuilder:rbac:groups=dataconnecthub.opendatahub.io,resources=data-store,verbs=get;list;watch;create;update;patch;delete;post;put
+// DCH data plane resources are checked by SubjectAccessReview only. The
+// controller needs the union of (1) the verbs kube-rbac-proxy checks for its
+// own REST calls (create/list connection types, create connections, register
+// flight services) and (2) every rule in the ClusterRoles it installs from
+// config/base (dch-read, dch-read-write, dch-admin, rest-service-data-access),
+// because RBAC escalation prevention requires holding a permission to grant it.
+// Keep these in sync with config/base/user-roles/clusterroles.yaml.
+// +kubebuilder:rbac:groups=dataconnecthub.opendatahub.io,resources=data-connections;data-connection-types,verbs=get;create;patch;delete
+// +kubebuilder:rbac:groups=dataconnecthub.opendatahub.io,resources=data-store,verbs=get
+// +kubebuilder:rbac:groups=dataconnecthub.opendatahub.io,resources=flight-services,verbs=create
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=services;configmaps;serviceaccounts,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=httproutes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways,verbs=get;list;watch
+// +kubebuilder:rbac:groups=route.openshift.io,resources=routes,verbs=get
 // +kubebuilder:rbac:groups=monitoring.coreos.com,resources=servicemonitors,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=config.openshift.io,resources=ingresses,verbs=get;list;watch
 // +kubebuilder:rbac:groups=config.openshift.io,resources=apiservers,verbs=get;list;watch
@@ -281,13 +306,22 @@ func (r *DataConnectServiceReconciler) Reconcile(ctx context.Context, req ctrl.R
 	if len(pendingDeployments) > 0 {
 		msg := fmt.Sprintf("Waiting for deployments: %v", pendingDeployments)
 		log.Info(msg)
-		return r.updateStatus(ctx, req, &platCfg, "Progressing", func(cr *dchv1alpha1.DataConnectService) {
-			r.gatewayStatus(ctx, cr, &platCfg)
+		var gatewayErr error
+		result, err := r.updateStatus(ctx, req, &platCfg, "Progressing", func(cr *dchv1alpha1.DataConnectService) {
+			gatewayErr = r.gatewayStatus(ctx, cr, &platCfg)
 			r.setCondition(cr, conditionTypeReady, metav1.ConditionFalse, "WaitingForDeployments", msg)
 			r.setCondition(cr, conditionTypeProvisioningSucceeded, metav1.ConditionTrue, "ProvisioningComplete", "Manifests applied successfully")
 			r.setCondition(cr, conditionTypeDegraded, metav1.ConditionFalse, "WaitingForDeployments", "No errors")
-			r.checkGRPCGatewaySupport(ctx, cr)
+			r.checkGRPCGatewaySupport(ctx, cr, &platCfg)
 		})
+		if err != nil {
+			return result, err
+		}
+		if gatewayErr != nil {
+			log.Error(gatewayErr, "failed to resolve the gateway address, keeping the last-known value")
+			return ctrl.Result{RequeueAfter: requeueOnError}, nil
+		}
+		return result, nil
 	}
 
 	// Phase 5: Register flight service instances
@@ -301,13 +335,22 @@ func (r *DataConnectServiceReconciler) Reconcile(ctx context.Context, req ctrl.R
 	}
 
 	// All ready
-	return r.updateStatus(ctx, req, &platCfg, "Ready", func(cr *dchv1alpha1.DataConnectService) {
-		r.gatewayStatus(ctx, cr, &platCfg)
+	var gatewayErr error
+	result, err := r.updateStatus(ctx, req, &platCfg, "Ready", func(cr *dchv1alpha1.DataConnectService) {
+		gatewayErr = r.gatewayStatus(ctx, cr, &platCfg)
 		r.setCondition(cr, conditionTypeReady, metav1.ConditionTrue, "Ready", "All resources reconciled and ready")
 		r.setCondition(cr, conditionTypeProvisioningSucceeded, metav1.ConditionTrue, "ProvisioningComplete", "Manifests applied successfully")
 		r.setCondition(cr, conditionTypeDegraded, metav1.ConditionFalse, "Reconciled", "No errors")
-		r.checkGRPCGatewaySupport(ctx, cr)
+		r.checkGRPCGatewaySupport(ctx, cr, &platCfg)
 	})
+	if err != nil {
+		return result, err
+	}
+	if gatewayErr != nil {
+		log.Error(gatewayErr, "failed to resolve the gateway address, keeping the last-known value")
+		return ctrl.Result{RequeueAfter: requeueOnError}, nil
+	}
+	return result, nil
 }
 
 func (r *DataConnectServiceReconciler) updateStatus(
@@ -325,13 +368,12 @@ func (r *DataConnectServiceReconciler) updateStatus(
 	cr.Status.Phase = phase
 	cr.Status.ObservedGeneration = cr.Generation
 	cr.Status.Distribution = platCfg.Distribution
-	cr.Status.Releases = r.buildReleases(&cr, platCfg, phase == conditionTypeReady)
 	mutate(&cr)
+	// The gateway check may change Ready to Not Ready. Base the platform
+	// release handshake on the final status rather than the requested phase.
+	cr.Status.Releases = r.buildReleases(&cr, platCfg, cr.Status.Phase == conditionTypeReady)
 
 	if err := r.Status().Update(ctx, &cr); err != nil {
-		if apierrors.IsConflict(err) {
-			return ctrl.Result{Requeue: true}, nil
-		}
 		return ctrl.Result{}, err
 	}
 
@@ -405,14 +447,29 @@ func (r *DataConnectServiceReconciler) reconcileManifests(
 		RelatedImageRestService:   r.RestImage,
 		RelatedImageFlightService: r.FlightImage,
 		RelatedImageKubeRbacProxy: r.KubeRbacProxyImage,
+		"GATEWAY_NAME":            gw.Name,
+		"GATEWAY_NAMESPACE":       gw.Namespace,
+		"OPERAND_NAMESPACE":       cr.Namespace,
 	}
-	resources, err := renderKustomization(r.ManifestsPath, manifestPath, patches, nil, paramsEnvOverrides)
+	if r.ControllerNamespace != "" {
+		paramsEnvOverrides["CONTROLLER_NAMESPACE"] = r.ControllerNamespace
+	}
+	resources, err := renderKustomization(r.ManifestsPath, manifestPath, patches, paramsEnvOverrides)
 	if err != nil {
 		return fmt.Errorf("rendering manifests: %w", err)
 	}
 
 	resources = renderFlightService(resources, cr.Name)
 	flightInstanceName := flightServiceResourceName(cr.Name)
+
+	tlsProfile, err := platformtls.LoadWithAdherence(ctx, r.Client)
+	if err != nil {
+		logf.FromContext(ctx).Error(err, "failed to resolve cluster TLS profile for kube-rbac-proxy")
+		return fmt.Errorf("resolving cluster TLS profile for kube-rbac-proxy: %w", err)
+	}
+	if err := setKubeRbacProxyTLSOpts(ctx, resources, tlsProfile.Spec); err != nil {
+		return fmt.Errorf("projecting TLS profile to kube-rbac-proxy: %w", err)
+	}
 
 	if err := setConfigMapGlobalNamespace(resources, cr.Namespace); err != nil {
 		return fmt.Errorf("setting config namespace: %w", err)
@@ -423,6 +480,9 @@ func (r *DataConnectServiceReconciler) reconcileManifests(
 	if err := setConfigMapFlightServiceAddress(resources, cr.Namespace, flightInstanceName); err != nil {
 		return fmt.Errorf("setting flight service address: %w", err)
 	}
+	if err := setConfigMapFlightTLSProfile(ctx, resources, flightInstanceName, tlsProfile.Spec); err != nil {
+		return fmt.Errorf("setting flight TLS profile: %w", err)
+	}
 	if cr.Spec.FlightService != nil {
 		if err := setConfigMapFlightConnectorSettings(resources, flightInstanceName, &cr.Spec.FlightService.ServiceOverrides); err != nil {
 			return fmt.Errorf("setting flight-service connector configuration: %w", err)
@@ -431,6 +491,10 @@ func (r *DataConnectServiceReconciler) reconcileManifests(
 
 	if !reconcileTraceEnv(resources, cr.Spec.Trace, nameRestServiceContainer, nameFlightServiceContainer) {
 		logf.FromContext(ctx).V(1).Info("trace reconciliation: no service container found in rendered manifests")
+	}
+
+	if !reconcileAuditEnv(resources, cr.Spec.Audit, nameRestServiceContainer, nameFlightServiceContainer) {
+		logf.FromContext(ctx).V(1).Info("audit reconciliation: no service container found in rendered manifests")
 	}
 
 	audiences := r.resolveTokenReviewAudiences(cr, platCfg)
@@ -490,7 +554,7 @@ func (r *DataConnectServiceReconciler) registerFlightService(ctx context.Context
 // rather than the platform ConfigMap because Distribution defaults to
 // "Standalone" when that ConfigMap is absent, which would silently drop metrics.
 func (r *DataConnectServiceReconciler) openShiftMonitoringAvailable(ctx context.Context) bool {
-	return r.kindServed(ctx, "config.openshift.io", "v1", "ClusterVersion") &&
+	return r.kindServed(ctx, openshiftConfigGroup, "v1", "ClusterVersion") &&
 		r.kindServed(ctx, "monitoring.coreos.com", "v1", "ServiceMonitor")
 }
 
@@ -569,9 +633,11 @@ func (r *DataConnectServiceReconciler) ensureInitDataConnectionTypes(ctx context
 
 type connectionTypeFile struct {
 	Name              string                   `json:"name"`
+	Label             string                   `json:"label"`
 	Provider          string                   `json:"provider"`
 	Description       string                   `json:"description"`
 	CredentialsFields []connectionTypeFieldDef `json:"credentials_fields"`
+	Tags              []string                 `json:"tags"`
 }
 
 type connectionTypeFieldDef struct {
@@ -581,16 +647,18 @@ type connectionTypeFieldDef struct {
 	Required     bool   `json:"required"`
 	Type         string `json:"type"`
 	DefaultValue string `json:"default_value"`
+	Sensitive    bool   `json:"sensitive"`
 }
 
 func (f *connectionTypeFile) toIDCTSpec() dchv1alpha1.InitDataConnectionTypeSpec {
 	fields := make([]dchv1alpha1.CredentialsField, len(f.CredentialsFields))
 	for i, cf := range f.CredentialsFields {
 		fields[i] = dchv1alpha1.CredentialsField{
-			Name:     cf.Name,
-			Label:    cf.Label,
-			Required: cf.Required,
-			Type:     cf.Type,
+			Name:      cf.Name,
+			Label:     cf.Label,
+			Required:  cf.Required,
+			Type:      cf.Type,
+			Sensitive: cf.Sensitive,
 		}
 		if cf.Description != "" {
 			fields[i].Description = &cf.Description
@@ -603,6 +671,10 @@ func (f *connectionTypeFile) toIDCTSpec() dchv1alpha1.InitDataConnectionTypeSpec
 		Name:              f.Name,
 		Provider:          f.Provider,
 		CredentialsFields: fields,
+		Tags:              f.Tags,
+	}
+	if f.Label != "" {
+		spec.Label = &f.Label
 	}
 	if f.Description != "" {
 		spec.Description = &f.Description
@@ -721,65 +793,94 @@ func (r *DataConnectServiceReconciler) resolveTokenReviewAudiences(cr *dchv1alph
 	return platCfg.TokenReviewAudiences
 }
 
-func (r *DataConnectServiceReconciler) gatewayStatus(ctx context.Context, cr *dchv1alpha1.DataConnectService, platCfg *platformConfig) {
+// gatewayStatus records the gateway attachment and the client-usable address
+// in the CR status. When no hostname resolves, Addresses is cleared rather
+// than carrying an empty value -- an entry that looks like an address but
+// cannot be connected to is the trap this field exists to avoid. A transient
+// lookup failure is returned without touching Addresses, so the CR keeps its
+// last-known value and the caller can retry.
+func (r *DataConnectServiceReconciler) gatewayStatus(ctx context.Context, cr *dchv1alpha1.DataConnectService, platCfg *platformConfig) error {
 	gw := r.resolveGateway(cr, platCfg)
 	cr.Status.HttpRoute = httpRouteResourceName(cr.Name)
 	cr.Status.Gateway = &dchv1alpha1.Gateway{
 		Name:      gw.Name,
 		Namespace: gw.Namespace,
 	}
-	hostname := r.resolveGatewayHostname(ctx, gw.Namespace, gw.Name)
-	cr.Status.Addresses = []dchv1alpha1.Addresses{
-		{
-			Type:  "hostname",
-			Value: hostname,
-		},
+	hostname, err := r.resolveGatewayHostname(ctx, gw.Namespace, gw.Name)
+	if err != nil {
+		return err
 	}
+	if hostname != "" {
+		cr.Status.Addresses = []dchv1alpha1.Addresses{
+			{
+				Type:  addressTypeHostname,
+				Value: hostname,
+			},
+		}
+	} else {
+		cr.Status.Addresses = nil
+	}
+	return nil
 }
 
-// checkGRPCGatewaySupport sets an advisory condition -- and escalates Degraded --
-// when the cluster's ingress appears to have HTTP/2 disabled. gRPC (flight-service)
-// traffic routed through an OpenShift Route in front of the gateway requires ALPN,
-// which OpenShift's router does not negotiate unless HTTP/2 is explicitly enabled.
-// Per the ODH PlatformObject contract (Ready must be a true aggregate -- see
-// https://github.com/opendatahub-io/odh-platform-utilities/blob/main/docs/platform-object-contract.md),
-// this overrides the caller's Ready=True/Phase=Ready when HTTP/2 is confirmed
-// disabled, so Ready and Phase never contradict Degraded. It must therefore run
-// after the caller's own Ready/Degraded/Phase are set.
-func (r *DataConnectServiceReconciler) checkGRPCGatewaySupport(ctx context.Context, cr *dchv1alpha1.DataConnectService) {
+// checkGRPCGatewaySupport checks the two Route prerequisites for gRPC ALPN:
+// HTTP/2 enabled on ingress and an explicit Route certificate/key. Inheriting
+// the ingress certificate is not sufficient, even if HTTP/2 is enabled. An
+// explicitly attached wildcard certificate is allowed. This does not probe ALPN.
+func (r *DataConnectServiceReconciler) checkGRPCGatewaySupport(ctx context.Context, cr *dchv1alpha1.DataConnectService, platCfg *platformConfig) {
 	enabled, known := r.http2Enabled(ctx)
 	if !known {
-		meta.RemoveStatusCondition(&cr.Status.Conditions, conditionTypeGRPCGatewaySupported)
+		r.setCondition(cr, conditionTypeGRPCGatewaySupported, metav1.ConditionUnknown, "IngressHTTP2Unknown",
+			"Cannot determine whether cluster ingress has HTTP/2 enabled")
 		return
 	}
-	if enabled {
-		r.setCondition(cr, conditionTypeGRPCGatewaySupported, metav1.ConditionTrue, "HTTP2Enabled",
-			"Cluster ingress has HTTP/2 enabled; gRPC (flight-service) traffic can negotiate ALPN through the gateway route")
+	if !enabled {
+		message := "gRPC (flight-service) through the gateway Route requires HTTP/2. Enable " +
+			annotationHTTP2Enable + "=true on the cluster ingress or serving IngressController."
+		r.unsupportedGRPCGateway(cr, reasonHTTP2Disabled, "GatewayHTTP2Disabled", message)
 		return
 	}
-	message := "gRPC (flight-service) traffic routed through an OpenShift Route requires HTTP/2, which OpenShift disables " +
-		"by default. A cluster-admin must enable it, e.g.: oc annotate ingresses.config/cluster " +
-		annotationHTTP2Enable + "=true --overwrite. The Route also needs its own dedicated TLS certificate " +
-		"instead of the shared default one for ALPN to negotiate."
-	r.setCondition(cr, conditionTypeGRPCGatewaySupported, metav1.ConditionFalse, "HTTP2Disabled", message)
-	r.setCondition(cr, conditionTypeDegraded, metav1.ConditionTrue, "GatewayHTTP2Disabled", message)
-	r.setCondition(cr, conditionTypeReady, metav1.ConditionFalse, "GatewayHTTP2Disabled", message)
+
+	gw := r.resolveGateway(cr, platCfg)
+	route, err := r.getGatewayRoute(ctx, gw.Namespace, gw.Name)
+	if err != nil {
+		r.setCondition(cr, conditionTypeGRPCGatewaySupported, metav1.ConditionUnknown, "GatewayRouteUnavailable",
+			fmt.Sprintf("Cannot inspect gateway Route %s/%s: %v", gw.Namespace, gw.Name, err))
+		return
+	}
+	termination, _, _ := unstructured.NestedString(route.Object, "spec", "tls", "termination")
+	if termination != "edge" && termination != routeTerminationReencrypt {
+		r.setCondition(cr, conditionTypeGRPCGatewaySupported, metav1.ConditionUnknown, "GatewayRouteNotTLSTerminated",
+			"Gateway Route is not edge- or reencrypt-terminated; Route certificate check does not apply")
+		return
+	}
+	certificate, _, _ := unstructured.NestedString(route.Object, "spec", "tls", "certificate")
+	key, _, _ := unstructured.NestedString(route.Object, "spec", "tls", "key")
+	if strings.TrimSpace(certificate) == "" || strings.TrimSpace(key) == "" {
+		message := fmt.Sprintf("Gateway Route %s/%s must have both spec.tls.certificate and spec.tls.key explicitly configured instead of relying on the default ingress certificate for HTTP/2 ALPN", gw.Namespace, gw.Name)
+		r.unsupportedGRPCGateway(cr, reasonRouteCertNotConfigured, reasonRouteCertNotConfigured, message)
+		return
+	}
+	r.setCondition(cr, conditionTypeGRPCGatewaySupported, metav1.ConditionTrue, reasonRouteHTTP2Configured,
+		"Cluster ingress has HTTP/2 enabled and the gateway Route has an explicit certificate/key; ALPN negotiation has not been probed")
+}
+
+// Preserve the existing Ready/Degraded behavior for confirmed HTTP/2 failures.
+func (r *DataConnectServiceReconciler) unsupportedGRPCGateway(cr *dchv1alpha1.DataConnectService, reason, degradedReason, message string) {
+	r.setCondition(cr, conditionTypeGRPCGatewaySupported, metav1.ConditionFalse, reason, message)
+	r.setCondition(cr, conditionTypeDegraded, metav1.ConditionTrue, degradedReason, message)
+	r.setCondition(cr, conditionTypeReady, metav1.ConditionFalse, degradedReason, message)
 	if cr.Status.Phase == conditionTypeReady {
 		cr.Status.Phase = "Not Ready"
 	}
 }
 
-// http2Enabled reports whether HTTP/2 appears enabled on the cluster's ingress,
-// checked cluster-wide (ingresses.config/cluster) and per-IngressController. known
-// is false when neither could be read (e.g. non-OpenShift cluster or missing RBAC),
-// in which case the caller should not draw a conclusion either way.
+// http2Enabled checks the cluster default and IngressController annotations.
+// This retains the controller's existing best-effort HTTP/2 check; it does not
+// establish that a particular Route actually negotiated ALPN.
 func (r *DataConnectServiceReconciler) http2Enabled(ctx context.Context) (enabled, known bool) {
 	clusterIngress := &unstructured.Unstructured{}
-	clusterIngress.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "config.openshift.io",
-		Version: "v1",
-		Kind:    "Ingress",
-	})
+	clusterIngress.SetGroupVersionKind(schema.GroupVersionKind{Group: openshiftConfigGroup, Version: "v1", Kind: "Ingress"})
 	if err := r.Get(ctx, types.NamespacedName{Name: "cluster"}, clusterIngress); err == nil {
 		known = true
 		if clusterIngress.GetAnnotations()[annotationHTTP2Enable] == valueTrue {
@@ -788,34 +889,124 @@ func (r *DataConnectServiceReconciler) http2Enabled(ctx context.Context) (enable
 	}
 
 	controllers := &unstructured.UnstructuredList{}
-	controllers.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "operator.openshift.io",
-		Version: "v1",
-		Kind:    "IngressControllerList",
-	})
+	controllers.SetGroupVersionKind(schema.GroupVersionKind{Group: "operator.openshift.io", Version: "v1", Kind: "IngressControllerList"})
 	if err := r.List(ctx, controllers, client.InNamespace("openshift-ingress-operator")); err == nil {
 		known = true
 		for i := range controllers.Items {
-			if controllers.Items[i].GetAnnotations()[annotationHTTP2Enable] == "true" {
+			if controllers.Items[i].GetAnnotations()[annotationHTTP2Enable] == valueTrue {
 				return true, true
 			}
 		}
 	}
-
 	return false, known
 }
 
-func (r *DataConnectServiceReconciler) resolveGatewayHostname(ctx context.Context, namespace, name string) string {
+// resolveGatewayHostname returns the hostname clients should use to reach the
+// gateway, preferring sources whose value is client-usable over the raw LB
+// address that Gateway status.addresses carries:
+//
+//  1. Gateway spec.listeners[*].hostname (first non-empty, non-wildcard) --
+//     the hostname Envoy's filter chains match on SNI and DNS points at in
+//     LoadBalancer mode; connections with any other SNI are dropped.
+//  2. spec.host of the Route the platform operator creates for the gateway in
+//     OcpRoute mode (same name and namespace as the Gateway) -- the
+//     router-assigned hostname.
+//  3. Gateway status.addresses[0].value -- the raw ELB address; last resort
+//     only, since it is not a usable SNI and goes stale when the gateway
+//     service is recreated.
+//
+// Lookups that mean "not there to use" -- the Gateway or Route not existing,
+// the API not being installed, and the documented Helm chart whose ClusterRole
+// does not yet grant Route reads -- resolve to an empty hostname, not an
+// error. Transient lookup failures are returned so the caller can retry
+// instead of publishing the fallback address as if it were resolved.
+func (r *DataConnectServiceReconciler) resolveGatewayHostname(ctx context.Context, namespace, name string) (string, error) {
 	gw := &unstructured.Unstructured{}
 	gw.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "gateway.networking.k8s.io",
+		Group:   gatewayAPIGroup,
 		Version: "v1",
-		Kind:    "Gateway",
+		Kind:    gatewayKind,
 	})
 	if err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, gw); err != nil {
-		return ""
+		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
+			// The Gateway (or the Gateway API itself) not being there yet is
+			// a normal provisioning state, not a lookup failure.
+			return "", nil
+		}
+		return "", fmt.Errorf("reading Gateway %s/%s: %w", namespace, name, err)
 	}
 
+	if hostname := firstListenerHostname(gw); hostname != "" {
+		return hostname, nil
+	}
+	host, err := r.gatewayRouteHost(ctx, namespace, name)
+	if err != nil {
+		return "", err
+	}
+	if host != "" {
+		return host, nil
+	}
+	return gatewayStatusAddress(gw), nil
+}
+
+// firstListenerHostname returns the first non-empty, non-wildcard listener
+// hostname of the Gateway. LoadBalancer-mode RHOAI gateways set one;
+// OcpRoute-mode listeners leave it unset because the Route owns the hostname
+// instead. Wildcard hostnames (e.g. *.example.com) are skipped: they describe
+// what the listener matches, not an address a client can connect to.
+func firstListenerHostname(gw *unstructured.Unstructured) string {
+	listeners, found, _ := unstructured.NestedSlice(gw.Object, "spec", "listeners")
+	if !found {
+		return ""
+	}
+	for _, l := range listeners {
+		listener, ok := l.(map[string]any)
+		if !ok {
+			continue
+		}
+		hostname, ok := listener["hostname"].(string)
+		if !ok || hostname == "" || strings.Contains(hostname, "*") {
+			continue
+		}
+		return hostname
+	}
+	return ""
+}
+
+// getGatewayRoute is shared by hostname resolution and the gRPC support check.
+// Callers decide whether a missing or forbidden Route is an error.
+func (r *DataConnectServiceReconciler) getGatewayRoute(ctx context.Context, namespace, name string) (*unstructured.Unstructured, error) {
+	route := &unstructured.Unstructured{}
+	route.SetGroupVersionKind(schema.GroupVersionKind{Group: "route.openshift.io", Version: "v1", Kind: "Route"})
+	if err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, route); err != nil {
+		return nil, err
+	}
+	return route, nil
+}
+
+// gatewayRouteHost returns spec.host of the OpenShift Route the platform
+// operator creates for the gateway in OcpRoute mode. The Route shares the
+// Gateway's name and namespace. Absent Route, absent Route API, and a
+// ClusterRole without Route reads (the documented Helm chart degrade case)
+// all return an empty host; any other lookup failure is returned as an error.
+func (r *DataConnectServiceReconciler) gatewayRouteHost(ctx context.Context, namespace, name string) (string, error) {
+	route, err := r.getGatewayRoute(ctx, namespace, name)
+	if err != nil {
+		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) || apierrors.IsForbidden(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("reading Route %s/%s: %w", namespace, name, err)
+	}
+	host, found, _ := unstructured.NestedString(route.Object, "spec", "host")
+	if !found {
+		return "", nil
+	}
+	return host, nil
+}
+
+// gatewayStatusAddress returns the first Gateway status address value, the
+// pre-existing fallback the raw LB hostname lands in.
+func gatewayStatusAddress(gw *unstructured.Unstructured) string {
 	addresses, found, _ := unstructured.NestedSlice(gw.Object, "status", "addresses")
 	if !found || len(addresses) == 0 {
 		return ""

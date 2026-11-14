@@ -2,9 +2,12 @@ use actix_web::web::{JsonConfig, PathConfig, QueryConfig};
 use actix_web::{HttpResponse, ResponseError, http::StatusCode};
 use commons::api::errors::SecretStoreError;
 use commons::api::errors::{ConnectorError, MetaStoreError};
+use kube_utils::auth::AuthError;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use thiserror::Error;
+
+use super::access_log::AuditError;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RestErrorResponse {
@@ -69,7 +72,15 @@ impl ResponseError for RestErrorResponse {
     }
 
     fn error_response(&self) -> HttpResponse {
-        HttpResponse::build(self.status_code()).json(self)
+        let status = self.status_code();
+        let mut response = HttpResponse::build(status).json(self);
+        response.extensions_mut().insert(AuditError {
+            code: self.code.clone(),
+            // Audit records can be more widely accessible than API responses.
+            // Do not copy backend-provided details into the audit stream.
+            message: status.canonical_reason().unwrap_or("Request failed").to_string(),
+        });
+        response
     }
 }
 
@@ -179,6 +190,36 @@ pub fn path_config() -> PathConfig {
     PathConfig::default().error_handler(|err, _req| extraction_error("invalid_path", err.into()))
 }
 
+impl From<AuthError> for RestErrorResponse {
+    fn from(err: AuthError) -> Self {
+        let (code, status, message) = match &err {
+            // Rejection reasons can echo API-server internals, so they are
+            // logged but not returned to the caller.
+            AuthError::Unauthenticated(_) => {
+                tracing::warn!("{err}");
+                (
+                    "unauthenticated",
+                    401,
+                    "An authenticated identity is required".to_string(),
+                )
+            },
+            // The denial names the secret and tenant namespace the caller
+            // already supplied, so it is returned verbatim to make the
+            // failure actionable for the end user.
+            AuthError::Forbidden(message) => ("forbidden", 403, message.clone()),
+            AuthError::TokenReviewError(_) | AuthError::AccessReviewError(_) | AuthError::Internal(_) => {
+                tracing::error!("{err}");
+                ("auth_error", 500, "Authorization check failed".to_string())
+            },
+        };
+        RestErrorResponse {
+            code: code.to_string(),
+            message,
+            status,
+        }
+    }
+}
+
 impl From<EndpointError> for RestErrorResponse {
     fn from(err: EndpointError) -> Self {
         match err {
@@ -275,5 +316,27 @@ impl From<ValidationError> for RestErrorResponse {
                 status: 400,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_response_attaches_sanitized_audit_details() {
+        let error = RestErrorResponse {
+            code: "connection".to_string(),
+            message: "postgres://user:secret@example.invalid".to_string(),
+            status: 503,
+        };
+
+        let response = error.error_response();
+        let extensions = response.extensions();
+        let audit_error = extensions.get::<AuditError>().unwrap();
+
+        assert_eq!(audit_error.code, "connection");
+        assert_eq!(audit_error.message, "Service Unavailable");
+        assert!(!audit_error.message.contains("secret"));
     }
 }

@@ -196,6 +196,22 @@ class TestUpdateConnection:
         req = UpdateConnectionRequest(name="updated")
         client.update_connection("123", req)
 
+    def test_sends_null_description(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert json.loads(request.content) == {"description": None}
+            return httpx.Response(200, json=SAMPLE_CONNECTION_JSON)
+
+        client = _make_client(httpx.MockTransport(handler))
+        client.update_connection("123", UpdateConnectionRequest(description=None))
+
+    def test_does_not_send_null_for_other_fields(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert json.loads(request.content) == {"description": "Sales warehouse"}
+            return httpx.Response(200, json=SAMPLE_CONNECTION_JSON)
+
+        client = _make_client(httpx.MockTransport(handler))
+        client.update_connection("123", UpdateConnectionRequest(name=None, description="Sales warehouse"))
+
 
 class TestDeleteConnection:
     def test_sends_delete(self) -> None:
@@ -418,6 +434,30 @@ class TestConnectionTypes:
                 credentials_fields=None,
             ),
         )
+
+    def test_update_sends_null_tags(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert json.loads(request.content) == {"tags": None}
+            return httpx.Response(200, json=SAMPLE_CONNECTION_TYPE_JSON)
+
+        client = _make_client(httpx.MockTransport(handler))
+        client.update_connection_type("ct-1", UpdateConnectionTypeRequest(tags=None))
+
+    def test_update_sends_null_label(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert json.loads(request.content) == {"label": None}
+            return httpx.Response(200, json=SAMPLE_CONNECTION_TYPE_JSON)
+
+        client = _make_client(httpx.MockTransport(handler))
+        client.update_connection_type("ct-1", UpdateConnectionTypeRequest(label=None))
+
+    def test_update_sends_label_value(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert json.loads(request.content) == {"label": "PostgreSQL Database"}
+            return httpx.Response(200, json=SAMPLE_CONNECTION_TYPE_JSON)
+
+        client = _make_client(httpx.MockTransport(handler))
+        client.update_connection_type("ct-1", UpdateConnectionTypeRequest(label="PostgreSQL Database"))
 
     def test_delete(self) -> None:
         transport = _make_transport(

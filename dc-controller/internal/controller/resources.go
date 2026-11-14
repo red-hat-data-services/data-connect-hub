@@ -20,6 +20,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/sha256"
+	cryptotls "crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -30,6 +31,8 @@ import (
 	"strings"
 	"time"
 
+	platformtls "github.com/opendatahub-io/odh-platform-utilities/framework/tls"
+	configv1 "github.com/openshift/api/config/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -49,6 +52,10 @@ import (
 // --- Kustomize rendering ---
 
 const (
+	resourceNameField = "name"
+	imageField        = "image"
+	envValueField     = "value"
+
 	// RelatedImageRestService is the env var and params.env key for the REST image.
 	RelatedImageRestService = "RELATED_IMAGE_ODH_DATA_CONNECT_HUB_REST_IMAGE"
 	// RelatedImageFlightService is the env var and params.env key for the Flight image.
@@ -62,7 +69,7 @@ const (
 // may reference resources outside its own directory (overlays/openshift pulls in
 // ../../base). rootPath must contain diskPath. params override values in the
 // staged base/params.env before Kustomize resolves replacements.
-func renderKustomization(rootPath, diskPath string, patches []kustypes.Patch, images []kustypes.Image, params map[string]string) ([]*unstructured.Unstructured, error) {
+func renderKustomization(rootPath, diskPath string, patches []kustypes.Patch, params map[string]string) ([]*unstructured.Unstructured, error) {
 	absPath, err := filepath.Abs(diskPath)
 	if err != nil {
 		return nil, fmt.Errorf("resolving path %s: %w", diskPath, err)
@@ -84,8 +91,8 @@ func renderKustomization(rootPath, diskPath string, patches []kustypes.Patch, im
 		}
 	}
 
-	if len(patches) > 0 || len(images) > 0 {
-		if err := patchKustomization(memFS, absPath, patches, images); err != nil {
+	if len(patches) > 0 {
+		if err := patchKustomization(memFS, absPath, patches); err != nil {
 			return nil, fmt.Errorf("patching kustomization: %w", err)
 		}
 	}
@@ -180,7 +187,7 @@ func mergeParamsEnv(fs filesys.FileSystem, path string, overrides map[string]str
 	return nil
 }
 
-func patchKustomization(fs filesys.FileSystem, dir string, patches []kustypes.Patch, images []kustypes.Image) error {
+func patchKustomization(fs filesys.FileSystem, dir string, patches []kustypes.Patch) error {
 	kustPath := filepath.Join(dir, "kustomization.yaml")
 	data, err := fs.ReadFile(kustPath)
 	if err != nil {
@@ -205,19 +212,6 @@ func patchKustomization(fs filesys.FileSystem, dir string, patches []kustypes.Pa
 		kust["patches"] = append(existing, patchSlice...)
 	}
 
-	if len(images) > 0 {
-		imgBytes, err := json.Marshal(images)
-		if err != nil {
-			return err
-		}
-		var imgSlice []any
-		if err := json.Unmarshal(imgBytes, &imgSlice); err != nil {
-			return err
-		}
-		existing, _ := kust["images"].([]any)
-		kust["images"] = append(existing, imgSlice...)
-	}
-
 	out, err := sigyaml.Marshal(kust)
 	if err != nil {
 		return fmt.Errorf("serializing kustomization: %w", err)
@@ -238,6 +232,12 @@ func buildServicePatches(deploymentName, containerName string, overrides *dchv1a
 
 	if overrides.Replicas != nil {
 		patchParts = append(patchParts, fmt.Sprintf("spec:\n  replicas: %d", *overrides.Replicas))
+	}
+
+	if overrides.ImagePullPolicy != nil {
+		patchParts = append(patchParts, fmt.Sprintf(
+			"spec:\n  template:\n    spec:\n      containers:\n        - name: %s\n          imagePullPolicy: %s",
+			containerName, *overrides.ImagePullPolicy))
 	}
 
 	if overrides.Resources != nil {
@@ -365,6 +365,13 @@ func replaceStringValue(value any, old, new string) any {
 		return strings.ReplaceAll(value, old, new)
 	case map[string]any:
 		for key, child := range value {
+			if key == imageField {
+				// Container image references must not be rewritten by the
+				// service rename: an image whose repository contains the
+				// service name (e.g. example.com/dch-flight-service) would
+				// otherwise be corrupted into a nonexistent reference.
+				continue
+			}
 			value[key] = replaceStringValue(child, old, new)
 		}
 	case []any:
@@ -507,12 +514,12 @@ func reconcileTraceEnv(resources []*unstructured.Unstructured, trace *dchv1alpha
 		wanted[name] = true
 	}
 
-	// Build the desired env var set
+	// Build the desired env var set. desiredVars keeps the deterministic order
+	// from traceEnv: iterating it directly (rather than a map, whose iteration
+	// order is randomized) keeps the rendered env list stable across
+	// reconciles, avoiding pointless deployment spec churn and rolling
+	// restarts.
 	desiredVars := traceEnv(trace)
-	desiredMap := make(map[string]string, len(desiredVars))
-	for _, v := range desiredVars {
-		desiredMap[v.Name] = v.Value
-	}
 
 	// All OTLP env vars that must be reconciled
 	otlpVars := map[string]bool{
@@ -556,11 +563,11 @@ func reconcileTraceEnv(resources []*unstructured.Unstructured, trace *dchv1alpha
 			}
 
 			// Add back the desired OTLP env vars
-			for name, value := range desiredMap {
-				newEnv = append(newEnv, map[string]any{"name": name, "value": value})
+			for _, v := range desiredVars {
+				newEnv = append(newEnv, map[string]any{"name": v.Name, "value": v.Value})
 			}
 
-			if len(newEnv) != len(env) || len(desiredMap) > 0 {
+			if len(newEnv) != len(env) || len(desiredVars) > 0 {
 				container["env"] = newEnv
 				containers[i] = container
 				changed = true
@@ -650,6 +657,80 @@ func traceEnv(trace *dchv1alpha1.Trace) []corev1.EnvVar {
 		vars = append(vars, corev1.EnvVar{Name: envOTLPCertificate, Value: trace.Certificate})
 	}
 	return vars
+}
+
+// auditEnv maps spec.audit onto the audit logging environment variables,
+// returning none when audit logging is disabled (the default).
+func auditEnv(audit *dchv1alpha1.Audit) []corev1.EnvVar {
+	if audit == nil || audit.Enabled == nil || !*audit.Enabled {
+		return nil
+	}
+	return []corev1.EnvVar{{Name: envAuditEnabled, Value: valueTrue}}
+}
+
+// reconcileAuditEnv reconciles the audit logging environment variable in
+// deployments, removing a stale variable when audit logging is disabled so
+// that clearing spec.audit.enabled actually turns it off in the running
+// containers.
+func reconcileAuditEnv(resources []*unstructured.Unstructured, audit *dchv1alpha1.Audit, containerNames ...string) bool {
+	wanted := make(map[string]bool, len(containerNames))
+	for _, name := range containerNames {
+		wanted[name] = true
+	}
+
+	desiredVars := auditEnv(audit)
+
+	updated := false
+	for _, obj := range resources {
+		if obj.GetKind() != kindDeployment {
+			continue
+		}
+		containers, found, _ := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", "containers")
+		if !found {
+			continue
+		}
+		changed := false
+		for i, c := range containers {
+			container, ok := c.(map[string]any)
+			if !ok {
+				continue
+			}
+			if name, _ := container["name"].(string); !wanted[name] {
+				continue
+			}
+
+			env, _ := container["env"].([]any)
+			var newEnv []any
+
+			// Remove the audit env var, preserve others
+			for _, e := range env {
+				existing, ok := e.(map[string]any)
+				if !ok {
+					newEnv = append(newEnv, e)
+					continue
+				}
+				if n, _ := existing["name"].(string); n != envAuditEnabled {
+					newEnv = append(newEnv, e)
+				}
+			}
+
+			// Add back the desired audit env var
+			for _, v := range desiredVars {
+				newEnv = append(newEnv, map[string]any{resourceNameField: v.Name, envValueField: v.Value})
+			}
+
+			if len(newEnv) != len(env) || len(desiredVars) > 0 {
+				container["env"] = newEnv
+				containers[i] = container
+				changed = true
+			}
+		}
+		if changed {
+			_ = unstructured.SetNestedSlice(obj.Object, containers, "spec", "template", "spec", "containers")
+			updated = true
+		}
+	}
+	return updated
 }
 
 func setConfigMapDiscoveryServiceAccount(resources []*unstructured.Unstructured, namespace, flightName string) error {
@@ -923,7 +1004,13 @@ func setKubeRbacProxyAudiences(resources []*unstructured.Unstructured, audiences
 			}
 			var args []any
 			if existing, ok := container["args"].([]any); ok {
-				args = existing
+				for _, value := range existing {
+					arg, ok := value.(string)
+					if ok && strings.HasPrefix(arg, "--auth-token-audiences=") {
+						continue
+					}
+					args = append(args, value)
+				}
 			}
 			args = append(args, arg)
 			container["args"] = args
@@ -931,6 +1018,119 @@ func setKubeRbacProxyAudiences(resources []*unstructured.Unstructured, audiences
 		}
 		_ = unstructured.SetNestedSlice(obj.Object, containers, "spec", "template", "spec", "containers")
 	}
+}
+
+func setKubeRbacProxyTLSOpts(
+	ctx context.Context,
+	resources []*unstructured.Unstructured,
+	spec configv1.TLSProfileSpec,
+) error {
+	minVersion := platformtls.MinVersionFromSpec(ctx, &spec, platformtls.FormatGo)
+	cipherSuites := ""
+	if spec.MinTLSVersion != configv1.VersionTLS13 {
+		cipherSuites = platformtls.CipherSuitesFromSpec(ctx, &spec)
+	}
+	if minVersion != "VersionTLS13" && cipherSuites != "" {
+		cipherNames := strings.Split(cipherSuites, ",")
+		if !slices.Contains(cipherNames, "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256") &&
+			!slices.Contains(cipherNames, "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256") {
+			return fmt.Errorf("cluster TLS profile: kube-rbac-proxy cannot serve HTTP/2 with cipher list %q", cipherSuites)
+		}
+	}
+	for _, obj := range resources {
+		if obj.GetKind() != kindDeployment {
+			continue
+		}
+		containers, found, _ := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", "containers")
+		if !found {
+			continue
+		}
+		for i, c := range containers {
+			container, ok := c.(map[string]any)
+			if !ok || container[resourceNameField] != nameKubeRbacProxy {
+				continue
+			}
+			var args []any
+			if existing, ok := container["args"].([]any); ok {
+				for index := 0; index < len(existing); index++ {
+					arg, _ := existing[index].(string)
+					if arg == "--tls-min-version" || arg == "--tls-cipher-suites" {
+						index++
+						continue
+					}
+					if strings.HasPrefix(arg, "--tls-min-version=") || strings.HasPrefix(arg, "--tls-cipher-suites=") {
+						continue
+					}
+					args = append(args, existing[index])
+				}
+			}
+			args = append(args, "--tls-min-version="+minVersion)
+			if cipherSuites != "" {
+				args = append(args, "--tls-cipher-suites="+cipherSuites)
+			}
+			container["args"] = args
+			containers[i] = container
+		}
+		_ = unstructured.SetNestedSlice(obj.Object, containers, "spec", "template", "spec", "containers")
+	}
+	return nil
+}
+
+// setConfigMapFlightTLSProfile projects the resolved cluster TLS profile into
+// every rendered Flight instance ConfigMap so the gRPC listener enforces the
+// same minimum version and TLS <= 1.2 cipher suites as the rest of the
+// platform. DCH is an adhering component: reconcileManifests resolves the
+// profile once and applies it to all serving surfaces regardless of adherence
+// policy. Cipher names are converted through the framework to IANA names the
+// rustls listener understands, and a profile whose cipher list is entirely
+// unusable fails the reconcile instead of silently starting with defaults.
+// The Flight service itself fails fast at startup on minima its rustls build
+// cannot serve (e.g. Old's TLS 1.0) rather than silently downgrading.
+func setConfigMapFlightTLSProfile(ctx context.Context, resources []*unstructured.Unstructured, flightName string, spec configv1.TLSProfileSpec) error {
+	minVersion := platformtls.MinVersionFromSpec(ctx, &spec, platformtls.FormatGo)
+
+	var cipherSuites []string
+	if spec.MinTLSVersion != configv1.VersionTLS13 {
+		scratch := &cryptotls.Config{}
+		tlsOption, _ := platformtls.ConfigFromProfile(spec)
+		tlsOption(scratch)
+		for _, id := range scratch.CipherSuites {
+			if name := cryptotls.CipherSuiteName(id); name != "" {
+				cipherSuites = append(cipherSuites, name)
+			}
+		}
+		if len(spec.Ciphers) > 0 && len(cipherSuites) == 0 {
+			return fmt.Errorf("flight TLS profile has no usable cipher suites for TLS <= 1.2: %v", spec.Ciphers)
+		}
+	}
+
+	for _, obj := range resources {
+		if obj.GetKind() != kindConfigMap || obj.GetLabels()[labelAppName] != flightName {
+			continue
+		}
+		config, data, err := parseConfigMapTOML(obj)
+		if err != nil {
+			return fmt.Errorf("parsing flight-service ConfigMap %q: %w", obj.GetName(), err)
+		}
+		if config == nil {
+			continue
+		}
+		tls, ok := config["tls"].(map[string]any)
+		if !ok {
+			continue
+		}
+		tls["min_version"] = minVersion
+		// TLS 1.3 cipher suites stay runtime-managed by the listener.
+		if len(cipherSuites) > 0 {
+			tls["ciphers"] = cipherSuites
+		} else {
+			delete(tls, "ciphers")
+		}
+		if err := setConfigMapTOML(obj, config, data); err != nil {
+			return fmt.Errorf("updating flight-service ConfigMap %q: %w", obj.GetName(), err)
+		}
+	}
+	return nil
 }
 
 // annotateDeploymentsWithContentHash computes a combined hash of all

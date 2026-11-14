@@ -22,6 +22,8 @@ import (
 	"fmt"
 	"os"
 
+	gozap "go.uber.org/zap"
+
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
@@ -32,10 +34,12 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
+	platformtls "github.com/opendatahub-io/odh-platform-utilities/framework/tls"
 	configv1 "github.com/openshift/api/config/v1"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
@@ -95,14 +99,18 @@ func main() {
 	flag.StringVar(&manifestsPath, "manifests-path", "/manifests",
 		"Path to the kustomize manifests directory containing base/, db/, and gateway/ subdirectories")
 	opts := zap.Options{
-		Development: true,
+		Development: false,
 	}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
 
-	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+	ctrl.SetLogger(zap.New(
+		zap.UseFlagOptions(&opts),
+		zap.RawZapOpts(gozap.Fields(gozap.String("service.name", "data-connect-hub"))),
+	).WithName("dc-controller"))
 
-	tlsResult, err := controllertls.Resolve(context.Background(), ctrl.GetConfigOrDie())
+	cfg := ctrl.GetConfigOrDie()
+	tlsResult, err := controllertls.Resolve(context.Background(), cfg)
 	if err != nil {
 		setupLog.Error(err, "Failed to resolve TLS profile")
 		os.Exit(1)
@@ -157,7 +165,7 @@ func main() {
 		metricsServerOptions.KeyName = metricsCertKey
 	}
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsServerOptions,
 		WebhookServer:          webhookServer,
@@ -183,22 +191,28 @@ func main() {
 
 	ctx, cancel := context.WithCancel(ctrl.SetupSignalHandler())
 	defer cancel()
-	if tlsResult.ProfileFetched {
-		watcher := &controllertls.ProfileWatcher{
-			Client:                 mgr.GetClient(),
-			InitialProfile:         tlsResult.ObservedProfile,
-			InitialAdherencePolicy: tlsResult.AdherencePolicy,
-			OnProfileChange: func(context.Context) {
-				setupLog.Info("TLS profile changed; initiating shutdown to reload")
+	if tlsResult.Watchable {
+		watcher := &platformtls.SecurityProfileWatcher{
+			Client:                    mgr.GetClient(),
+			InitialTLSProfileSpec:     tlsResult.Spec,
+			InitialTLSAdherencePolicy: tlsResult.AdherencePolicy,
+			OnProfileChange: func(_ context.Context, oldProfile, newProfile configv1.TLSProfileSpec) {
+				setupLog.Info("TLS profile changed; initiating shutdown to reload", "old", oldProfile, "new", newProfile)
 				cancel()
 			},
-			OnAdherencePolicyChange: func(context.Context) {
-				setupLog.Info("TLS adherence policy changed; initiating shutdown to reload")
+			OnAdherencePolicyChange: func(_ context.Context, oldPolicy, newPolicy configv1.TLSAdherencePolicy) {
+				setupLog.Info("TLS adherence policy changed; initiating shutdown to reload", "old", oldPolicy, "new", newPolicy)
 				cancel()
 			},
 		}
 		if err := watcher.SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to set up TLS profile watcher")
+			os.Exit(1)
+		}
+		if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+			return controllertls.WatchAPIServerReadAuthorization(ctx, mgr.GetAPIReader(), cancel)
+		})); err != nil {
+			setupLog.Error(err, "Failed to set up TLS profile authorization watchdog")
 			os.Exit(1)
 		}
 	}
@@ -211,6 +225,7 @@ func main() {
 		RestImage:           requiredEnv(controller.RelatedImageRestService),
 		FlightImage:         requiredEnv(controller.RelatedImageFlightService),
 		KubeRbacProxyImage:  requiredEnv(controller.RelatedImageKubeRbacProxy),
+		ControllerNamespace: controller.ResolveControllerNamespace(),
 		FlightServiceClient: controller.NewHTTPFlightServiceClient(restURLResolver),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "dataconnectservice")

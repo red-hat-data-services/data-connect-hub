@@ -4,7 +4,7 @@ use commons::api::connections::CredentialsRef;
 use commons::api::connections::DataConnectionResource;
 use commons::api::storage::{MetaStore, MetaStoreReader};
 
-use crate::clients::flight::FlightDataClient;
+use crate::clients::flight::{FlightDataClient, FlightRequestContext};
 
 use crate::rest::errors::ValidationError;
 use crate::state::ApiService;
@@ -40,9 +40,10 @@ async fn set_data_connection_status(
 
 pub async fn audit_data_connection(
     api_service: &ApiService,
-    tenant_id: &str,
+    context: &FlightRequestContext,
     data_connection_id: &str,
 ) -> Result<(), ValidationError> {
+    let tenant_id = &context.tenant_id;
     let meta_store = api_service.meta_store.clone();
     let secret_store = api_service.secret_store.clone();
 
@@ -101,7 +102,7 @@ pub async fn audit_data_connection(
 
     let result = api_service
         .flight_client(flight.resource.internal_url.as_str())
-        .check_data_connection(tenant_id, &connection_id)
+        .check_data_connection(context, &connection_id)
         .await;
 
     match result {
@@ -146,10 +147,28 @@ pub(crate) async fn audit_data_connection_types(api_service: &ApiService) -> Res
     for data_connection_type in data_connection_types.items {
         let provider = data_connection_type.resource.provider;
         let mut flight_url = None;
+        let mut supported_formats: Vec<DataFormat> = vec![];
 
         for flight in &flights.items {
-            if flight.resource.supported_connectors.contains(&provider) && flight.resource.status.ready {
-                flight_url = Some(flight.resource.external_url.clone());
+            if flight.resource.supported_connectors.contains(&provider) {
+                supported_formats = flight
+                    .resource
+                    .connector_capabilities
+                    .get(&provider)
+                    .map(|fmts| {
+                        fmts.iter()
+                            .filter_map(|f| {
+                                DataFormat::from_string(f).inspect_err(|_| {
+                                    tracing::warn!(provider = %provider, format = %f, "unknown data format in connector capabilities, skipping");
+                                }).ok()
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                if flight.resource.status.ready {
+                    flight_url = Some(flight.resource.external_url.clone());
+                }
                 break;
             }
         }
@@ -157,6 +176,7 @@ pub(crate) async fn audit_data_connection_types(api_service: &ApiService) -> Res
         let update_fn = Arc::new(move |_current: DataConnectionTypeStatus| {
             let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
             Ok(DataConnectionTypeStatus {
+                supported_formats: supported_formats.clone(),
                 flight_ready: flight_url.is_some(),
                 flight_url: flight_url.clone(),
                 message: None,
@@ -269,6 +289,7 @@ mod tests {
                     external_url: "http://127.0.0.1:1".to_string(),
                     internal_url: "http://127.0.0.1:1".to_string(),
                     supported_connectors: vec![],
+                    connector_capabilities: Default::default(),
                     status: Default::default(),
                 },
             })
@@ -402,6 +423,7 @@ mod tests {
             metadata: make_metadata("conn-1"),
             resource: DataConnection {
                 name: "test".to_string(),
+                description: None,
                 data_connection_type_id: "pg".to_string(),
                 format: DataFormat::Tabular,
                 credentials_ref: creds,
@@ -420,6 +442,7 @@ mod tests {
             metadata: make_metadata("pg"),
             resource: DataConnectionType {
                 name: "PostgreSQL".to_string(),
+                label: None,
                 provider: "postgres".to_string(),
                 description: None,
                 credentials_fields: required_fields
@@ -432,8 +455,11 @@ mod tests {
                         required: true,
                         enum_values: None,
                         default_value: None,
+                        sensitive: false,
+                        multiple: false,
                     })
                     .collect(),
+                tags: None,
             },
             status: Default::default(),
         }
@@ -456,13 +482,21 @@ mod tests {
         ApiService::new(meta, secrets, None, None, "test-tenant".to_string())
     }
 
+    fn request_context() -> FlightRequestContext {
+        FlightRequestContext {
+            tenant_id: "tenant".to_string(),
+            identity: Some("test-user".to_string()),
+            request_id: "test-request".to_string(),
+        }
+    }
+
     #[tokio::test]
     async fn test_connection_not_found() {
         let meta = Arc::new(MockMetaStore::not_found()) as Arc<dyn MetaStore + Send + Sync>;
         let secrets = Arc::new(MockSecretStore { secret: None }) as Arc<dyn SecretStore + Send + Sync>;
         let api_service = make_api_service(meta, secrets);
 
-        let result = audit_data_connection(&api_service, "tenant", "missing").await;
+        let result = audit_data_connection(&api_service, &request_context(), "missing").await;
         assert!(matches!(result, Err(ValidationError::InvalidDataConnectionId(_))));
     }
 
@@ -476,7 +510,7 @@ mod tests {
         let secrets = Arc::new(MockSecretStore { secret: None });
         let api_service = make_api_service(meta, secrets);
 
-        let result = audit_data_connection(&api_service, "tenant", "conn-1").await;
+        let result = audit_data_connection(&api_service, &request_context(), "conn-1").await;
         assert!(matches!(result, Err(ValidationError::InvalidSecret)));
     }
 
@@ -492,7 +526,7 @@ mod tests {
         });
         let api_service = make_api_service(meta, secrets);
 
-        let result = audit_data_connection(&api_service, "tenant", "conn-1").await;
+        let result = audit_data_connection(&api_service, &request_context(), "conn-1").await;
         assert!(matches!(result, Err(ValidationError::CredentialsCheckFailed(_))));
     }
 
@@ -508,7 +542,7 @@ mod tests {
         });
         let api_service = make_api_service(meta, secrets);
 
-        let result = audit_data_connection(&api_service, "tenant", "conn-1").await;
+        let result = audit_data_connection(&api_service, &request_context(), "conn-1").await;
         assert!(matches!(result, Err(ValidationError::ConnectionCheckFailed(_))));
     }
 
@@ -522,7 +556,7 @@ mod tests {
         let secrets = Arc::new(MockSecretStore { secret: None });
         let api_service = make_api_service(meta.clone(), secrets);
 
-        let _ = audit_data_connection(&api_service, "tenant", "conn-1").await;
+        let _ = audit_data_connection(&api_service, &request_context(), "conn-1").await;
 
         let status = meta.last_status.read().unwrap();
         let status = status.as_ref().expect("status should have been updated");
@@ -542,7 +576,7 @@ mod tests {
         });
         let api_service = make_api_service(meta.clone(), secrets);
 
-        let _ = audit_data_connection(&api_service, "tenant", "conn-1").await;
+        let _ = audit_data_connection(&api_service, &request_context(), "conn-1").await;
 
         let status = meta.last_status.read().unwrap();
         let status = status.as_ref().expect("status should have been updated");
@@ -562,11 +596,281 @@ mod tests {
         });
         let api_service = make_api_service(meta.clone(), secrets);
 
-        let _ = audit_data_connection(&api_service, "tenant", "conn-1").await;
+        let _ = audit_data_connection(&api_service, &request_context(), "conn-1").await;
 
         let status = meta.last_status.read().unwrap();
         let status = status.as_ref().expect("status should have been updated");
         assert_eq!(status.state, DataConnectionState::IngestionNotReady);
         assert_eq!(status.message.as_deref(), Some("Connection check failed"));
+    }
+
+    // --- audit_data_connection_types tests ---
+
+    struct AuditTypeMockStore {
+        connection_types: Vec<DataConnectionTypeResource>,
+        flight_services: Vec<commons::api::flight_discovery::FlightServiceResource>,
+        updated_statuses: RwLock<HashMap<String, DataConnectionTypeStatus>>,
+    }
+
+    #[async_trait::async_trait]
+    impl MetaStoreReader for AuditTypeMockStore {
+        async fn get_data_connections(&self, _: &str) -> Result<ResourceList<DataConnectionResource>, MetaStoreError> {
+            unimplemented!()
+        }
+        async fn get_data_connection(&self, _: &str, _: &str) -> Result<DataConnectionResource, MetaStoreError> {
+            unimplemented!()
+        }
+        async fn get_data_connection_types(
+            &self,
+            _: &str,
+        ) -> Result<ResourceList<DataConnectionTypeResource>, MetaStoreError> {
+            unimplemented!()
+        }
+        async fn get_data_connection_type(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<DataConnectionTypeResource, MetaStoreError> {
+            unimplemented!()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl commons::api::storage::FlightDiscoveryStore for AuditTypeMockStore {
+        async fn create_flight_service(
+            &self,
+            _: &commons::api::flight_discovery::FlightService,
+        ) -> Result<commons::api::flight_discovery::FlightServiceResource, MetaStoreError> {
+            unimplemented!()
+        }
+        async fn get_all_flight_services(
+            &self,
+        ) -> Result<ResourceList<commons::api::flight_discovery::FlightServiceResource>, MetaStoreError> {
+            Ok(ResourceList {
+                total_count: self.flight_services.len(),
+                items: self.flight_services.clone(),
+            })
+        }
+        async fn get_flight_service_by_connector(
+            &self,
+            _: &str,
+        ) -> Result<commons::api::flight_discovery::FlightServiceResource, MetaStoreError> {
+            unimplemented!()
+        }
+        async fn get_flight_service(
+            &self,
+            _: &str,
+        ) -> Result<commons::api::flight_discovery::FlightServiceResource, MetaStoreError> {
+            unimplemented!()
+        }
+        async fn update_flight_service(
+            &self,
+            _: &str,
+            _: Arc<
+                dyn Fn(
+                        commons::api::flight_discovery::FlightService,
+                    ) -> Result<commons::api::flight_discovery::FlightService, MetaStoreError>
+                    + Send
+                    + Sync,
+            >,
+        ) -> Result<commons::api::flight_discovery::FlightServiceResource, MetaStoreError> {
+            unimplemented!()
+        }
+        async fn delete_flight_service(&self, _: &str) -> Result<(), MetaStoreError> {
+            unimplemented!()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MetaStore for AuditTypeMockStore {
+        async fn create_data_connection(
+            &self,
+            _: &str,
+            _: &DataConnection,
+        ) -> Result<DataConnectionResource, MetaStoreError> {
+            unimplemented!()
+        }
+        async fn update_data_connection(
+            &self,
+            _: &str,
+            _: &str,
+            _: Arc<dyn Fn(DataConnection) -> Result<DataConnection, MetaStoreError> + Send + Sync>,
+        ) -> Result<DataConnectionResource, MetaStoreError> {
+            unimplemented!()
+        }
+        async fn update_data_connection_status(
+            &self,
+            _: &str,
+            _: &str,
+            _: Arc<dyn Fn(DataConnectionStatus) -> Result<DataConnectionStatus, MetaStoreError> + Send + Sync>,
+        ) -> Result<DataConnectionResource, MetaStoreError> {
+            unimplemented!()
+        }
+        async fn delete_data_connection(&self, _: &str, _: &str) -> Result<(), MetaStoreError> {
+            unimplemented!()
+        }
+        async fn get_all_data_connection_types(
+            &self,
+        ) -> Result<ResourceList<DataConnectionTypeResource>, MetaStoreError> {
+            Ok(ResourceList {
+                total_count: self.connection_types.len(),
+                items: self.connection_types.clone(),
+            })
+        }
+        async fn create_data_connection_type(
+            &self,
+            _: &str,
+            _: &DataConnectionType,
+        ) -> Result<DataConnectionTypeResource, MetaStoreError> {
+            unimplemented!()
+        }
+        async fn update_data_connection_type(
+            &self,
+            _: &str,
+            _: &str,
+            _: Arc<dyn Fn(DataConnectionType) -> Result<DataConnectionType, MetaStoreError> + Send + Sync>,
+        ) -> Result<DataConnectionTypeResource, MetaStoreError> {
+            unimplemented!()
+        }
+        async fn update_data_connection_type_status(
+            &self,
+            id: &str,
+            update_fn: Arc<
+                dyn Fn(DataConnectionTypeStatus) -> Result<DataConnectionTypeStatus, MetaStoreError> + Send + Sync,
+            >,
+        ) -> Result<DataConnectionTypeResource, MetaStoreError> {
+            let new_status = update_fn(DataConnectionTypeStatus::default())?;
+            self.updated_statuses
+                .write()
+                .unwrap()
+                .insert(id.to_string(), new_status.clone());
+            let dct = self.connection_types.iter().find(|d| d.metadata.id == id).unwrap();
+            let mut res = dct.clone();
+            res.status = new_status;
+            Ok(res)
+        }
+        async fn delete_data_connection_type(&self, _: &str, _: &str) -> Result<(), MetaStoreError> {
+            unimplemented!()
+        }
+    }
+
+    fn make_flight_service(
+        name: &str,
+        connectors: Vec<&str>,
+        capabilities: HashMap<String, Vec<String>>,
+        ready: bool,
+    ) -> commons::api::flight_discovery::FlightServiceResource {
+        commons::api::flight_discovery::FlightServiceResource {
+            metadata: make_metadata(name),
+            resource: commons::api::flight_discovery::FlightService {
+                name: name.to_string(),
+                namespace: "test".to_string(),
+                external_url: format!("grpc://{name}:50051"),
+                internal_url: format!("grpc://{name}:50051"),
+                supported_connectors: connectors.into_iter().map(String::from).collect(),
+                connector_capabilities: capabilities,
+                status: commons::api::flight_discovery::FlightServiceStatus { ready },
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn test_audit_types_flight_ready_sets_formats_and_ready() {
+        let dct = make_dct(vec![]);
+        let caps = HashMap::from([("postgres".to_string(), vec!["tabular".to_string()])]);
+        let flight = make_flight_service("fs-1", vec!["postgres"], caps, true);
+
+        let store = Arc::new(AuditTypeMockStore {
+            connection_types: vec![dct],
+            flight_services: vec![flight],
+            updated_statuses: RwLock::new(HashMap::new()),
+        });
+        let secrets = Arc::new(MockSecretStore { secret: None });
+        let api_service = make_api_service(store.clone(), secrets);
+
+        audit_data_connection_types(&api_service).await.unwrap();
+
+        let statuses = store.updated_statuses.read().unwrap();
+        let status = statuses.get("pg").expect("status should be updated");
+        assert_eq!(status.supported_formats, vec![DataFormat::Tabular]);
+        assert!(status.flight_ready);
+        assert_eq!(status.flight_url.as_deref(), Some("grpc://fs-1:50051"));
+    }
+
+    #[tokio::test]
+    async fn test_audit_types_flight_not_ready_sets_formats_but_not_ready() {
+        let dct = make_dct(vec![]);
+        let caps = HashMap::from([("postgres".to_string(), vec!["tabular".to_string()])]);
+        let flight = make_flight_service("fs-1", vec!["postgres"], caps, false);
+
+        let store = Arc::new(AuditTypeMockStore {
+            connection_types: vec![dct],
+            flight_services: vec![flight],
+            updated_statuses: RwLock::new(HashMap::new()),
+        });
+        let secrets = Arc::new(MockSecretStore { secret: None });
+        let api_service = make_api_service(store.clone(), secrets);
+
+        audit_data_connection_types(&api_service).await.unwrap();
+
+        let statuses = store.updated_statuses.read().unwrap();
+        let status = statuses.get("pg").expect("status should be updated");
+        assert_eq!(status.supported_formats, vec![DataFormat::Tabular]);
+        assert!(!status.flight_ready);
+        assert!(status.flight_url.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_audit_types_no_flight_clears_formats() {
+        let dct = make_dct(vec![]);
+
+        let store = Arc::new(AuditTypeMockStore {
+            connection_types: vec![dct],
+            flight_services: vec![],
+            updated_statuses: RwLock::new(HashMap::new()),
+        });
+        let secrets = Arc::new(MockSecretStore { secret: None });
+        let api_service = make_api_service(store.clone(), secrets);
+
+        audit_data_connection_types(&api_service).await.unwrap();
+
+        let statuses = store.updated_statuses.read().unwrap();
+        let status = statuses.get("pg").expect("status should be updated");
+        assert!(status.supported_formats.is_empty());
+        assert!(!status.flight_ready);
+        assert!(status.flight_url.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_audit_types_binary_connector_gets_both_formats() {
+        let s3_dct = DataConnectionTypeResource {
+            metadata: make_metadata("s3-type"),
+            resource: DataConnectionType {
+                name: "S3".to_string(),
+                label: None,
+                provider: "s3".to_string(),
+                description: None,
+                credentials_fields: vec![],
+                tags: None,
+            },
+            status: Default::default(),
+        };
+        let caps = HashMap::from([("s3".to_string(), vec!["tabular".to_string(), "binary".to_string()])]);
+        let flight = make_flight_service("fs-1", vec!["s3"], caps, true);
+
+        let store = Arc::new(AuditTypeMockStore {
+            connection_types: vec![s3_dct],
+            flight_services: vec![flight],
+            updated_statuses: RwLock::new(HashMap::new()),
+        });
+        let secrets = Arc::new(MockSecretStore { secret: None });
+        let api_service = make_api_service(store.clone(), secrets);
+
+        audit_data_connection_types(&api_service).await.unwrap();
+
+        let statuses = store.updated_statuses.read().unwrap();
+        let status = statuses.get("s3-type").expect("status should be updated");
+        assert_eq!(status.supported_formats, vec![DataFormat::Tabular, DataFormat::Binary]);
+        assert!(status.flight_ready);
     }
 }

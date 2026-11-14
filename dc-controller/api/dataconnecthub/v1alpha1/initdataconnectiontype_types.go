@@ -62,6 +62,15 @@ type CredentialsField struct {
 	// +kubebuilder:validation:MaxLength=1024
 	// +optional
 	DefaultValue *string `json:"defaultValue,omitempty"`
+
+	// sensitive indicates whether the field value should be masked in the UI
+	// +optional
+	Sensitive bool `json:"sensitive,omitempty"`
+
+	// multiple indicates whether more than one enum value may be selected;
+	// only meaningful when type is "enum"
+	// +optional
+	Multiple bool `json:"multiple,omitempty"`
 }
 
 // InitDataConnectionTypeSpec defines the desired state of InitDataConnectionType.
@@ -69,6 +78,13 @@ type InitDataConnectionTypeSpec struct {
 	// name is the unique name of the connection type
 	// +kubebuilder:validation:MaxLength=253
 	Name string `json:"name"`
+
+	// label is an optional display label rendered by the UI instead of name
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`\S`
+	// +optional
+	Label *string `json:"label,omitempty"`
 
 	// provider identifies the backing data provider (e.g. "postgres", "s3")
 	// +kubebuilder:validation:MaxLength=253
@@ -81,6 +97,14 @@ type InitDataConnectionTypeSpec struct {
 
 	// credentialsFields defines the fields required to configure credentials for this connection type
 	CredentialsFields []CredentialsField `json:"credentialsFields"`
+
+	// tags are optional free-form labels for categorising the connection type
+	// +kubebuilder:validation:MaxItems=32
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=256
+	// +kubebuilder:validation:items:Pattern=`\S`
+	// +optional
+	Tags []string `json:"tags,omitempty"`
 }
 
 // InitDataConnectionTypeStatus defines the observed state of InitDataConnectionType.
@@ -100,6 +124,8 @@ type InitDataConnectionTypeStatus struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:categories=opendatahub,shortName=idct
 // +kubebuilder:printcolumn:name="Provider",type=string,JSONPath=`.spec.provider`
+// +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
+// +kubebuilder:printcolumn:name="Synced",type=string,JSONPath=`.status.conditions[?(@.type=="Synced")].status`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // InitDataConnectionType is the Schema for the initdataconnectiontypes API
