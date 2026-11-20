@@ -129,14 +129,18 @@ func specToConnectionType(spec *dchv1alpha1.InitDataConnectionTypeSpec) Connecti
 			Type:         cf.Type,
 			EnumValues:   enumValues,
 			DefaultValue: cf.DefaultValue,
+			Sensitive:    cf.Sensitive,
+			Multiple:     cf.Multiple,
 		}
 	}
 
 	return ConnectionType{
 		Name:              spec.Name,
+		Label:             spec.Label,
 		Provider:          spec.Provider,
 		Description:       spec.Description,
 		CredentialsFields: fields,
+		Tags:              spec.Tags,
 	}
 }
 

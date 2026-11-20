@@ -105,6 +105,9 @@ func (r *SecretWatcherReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		CredentialsRef:       &CredentialsRef{Secret: secret.Name},
 		Properties:           map[string]string{},
 	}
+	if desc := secret.Annotations[annotationDescription]; desc != "" {
+		conn.Description = &desc
+	}
 
 	log.Info("migrating ODH connection", "name", conn.Name, "secretRef", secret.Name, "namespace", secret.Namespace)
 
@@ -134,6 +137,14 @@ func (r *SecretWatcherReconciler) resolveConnectionTypeID(ctx context.Context, n
 	for _, t := range types {
 		if t.Resource.Name == typeRef {
 			return t.Metadata.ID, nil
+		}
+	}
+
+	if alias, ok := builtinProviderAliases[typeRef]; ok {
+		for _, t := range types {
+			if t.Resource.Provider == alias {
+				return t.Metadata.ID, nil
+			}
 		}
 	}
 

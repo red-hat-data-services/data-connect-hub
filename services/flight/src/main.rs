@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
-use commons::utils::{TraceConfig, init_tracing, log_trace_exporter};
+use commons::utils::audit::AuditConfig;
+use commons::utils::{TraceConfig, init_tracing_json, log_trace_exporter};
 #[cfg(feature = "elasticsearch")]
 use elasticsearch_connector::ElasticsearchConnector;
 use flight_service::flight::DataIngestionService;
@@ -111,14 +112,22 @@ async fn main() -> Result<()> {
     config.query.validate().map_err(|e| anyhow::anyhow!(e))?;
 
     let trace = TraceConfig::from_env();
-    let tracer_provider = init_tracing(SERVICE_NAME, args.json_logs, &trace)?;
+    let audit = AuditConfig::from_env();
+    let tracer_provider = init_tracing_json(SERVICE_NAME, args.json_logs, &trace)?;
 
     tracing::info!("Starting DataConnectorHub Flight service");
+    tracing::info!(
+        audit_enabled = audit.enabled,
+        audit_log_queries = audit.log_queries,
+        "Audit logging is {}, query logging is {}",
+        if audit.enabled { "enabled" } else { "disabled" },
+        if audit.log_queries { "enabled" } else { "disabled" }
+    );
     log_trace_exporter(&trace);
 
     let addr: std::net::SocketAddr = format!("{}:{}", config.server.address, config.server.port).parse()?;
     let builder = tonic::transport::Server::builder();
-    let builder = configure_tls(builder, &config.tls).await?;
+    let (builder, tls_acceptor) = configure_tls(builder, &config.tls).await?;
     configure_metrics(&config)?;
 
     let connectors_registry = Arc::new(build_connectors_registry(&config));
@@ -127,13 +136,14 @@ async fn main() -> Result<()> {
         batch_size: config.query.batch_size,
     };
 
-    let tenant_id = config.global_connection_types.tenant_id;
+    let global_tenant_ids = config.global_connection_types.tenant_ids;
     let auth = config.auth;
-    let meta_store = Arc::new(PgMetaStore::new(config.database, tenant_id).await?);
+    let meta_store = Arc::new(PgMetaStore::new(config.database, global_tenant_ids).await?);
 
-    let service = DataIngestionService::new(connectors_registry, meta_store, secret_store, query_options);
+    let service =
+        DataIngestionService::new(connectors_registry, meta_store, secret_store, query_options).with_audit(audit);
 
-    let server_result = start_server(builder, &auth, service, addr).await;
+    let server_result = start_server(builder, tls_acceptor, &auth, service, addr).await;
     tracing::info!("DataConnectorHub Flight service stopped");
 
     if let Some(provider) = tracer_provider
@@ -174,7 +184,7 @@ mod tests {
             auth: AuthConfig::default(),
             metrics: MetricsConfig::default(),
             tls: TlsConfig::default(),
-            global_connection_types: GlobalConnectionTypes::new("test".to_string()),
+            global_connection_types: GlobalConnectionTypes::new(vec!["test".to_string()]),
         }
     }
 

@@ -151,6 +151,45 @@ class TestEmptyUpdateGuards:
         req = client._rest.update_connection.call_args[0][1]
         assert req.credentials_ref == CredentialsRef(secret="secret/new")
 
+    def test_update_connection_description_to_null(self) -> None:
+        from data_connect_hub.models import DataConnection
+
+        conn = DataConnection.model_validate(SAMPLE_CONNECTION_JSON)
+        client = DataConnectClient("localhost")
+        client._rest.update_connection = MagicMock(return_value=conn)  # type: ignore[method-assign]
+
+        client.update_connection("123", description=None)
+        request = client._rest.update_connection.call_args[0][1]
+        assert request.model_dump(exclude_unset=True) == {"description": None}
+
+    def test_update_connection_omits_unset_description(self) -> None:
+        from data_connect_hub.models import DataConnection
+
+        conn = DataConnection.model_validate(SAMPLE_CONNECTION_JSON)
+        client = DataConnectClient("localhost")
+        client._rest.update_connection = MagicMock(return_value=conn)  # type: ignore[method-assign]
+
+        client.update_connection("123", name="renamed")
+        request = client._rest.update_connection.call_args[0][1]
+        assert request.model_dump(exclude_unset=True) == {"name": "renamed"}
+
+    def test_create_connection_with_description(self) -> None:
+        from data_connect_hub.models import CredentialsRef, DataConnection
+
+        conn = DataConnection.model_validate(SAMPLE_CONNECTION_JSON)
+        client = DataConnectClient("localhost")
+        client._rest.create_connection = MagicMock(return_value=conn)  # type: ignore[method-assign]
+
+        client.create_connection(
+            name="test-conn",
+            connection_type_id="postgres",
+            data_format="tabular",
+            credentials_ref=CredentialsRef(secret="existing"),
+            description="Sales warehouse",
+        )
+        request = client._rest.create_connection.call_args[0][0]
+        assert request.description == "Sales warehouse"
+
     def test_update_connection_type_description_to_null(self) -> None:
         from data_connect_hub.models import ConnectionType
 
@@ -161,6 +200,50 @@ class TestEmptyUpdateGuards:
         client.update_connection_type("ct-1", description=None)
         request = client._rest.update_connection_type.call_args[0][1]
         assert request.model_dump(exclude_unset=True) == {"description": None}
+
+    def test_update_connection_type_tags_to_null(self) -> None:
+        from data_connect_hub.models import ConnectionType
+
+        connection_type = ConnectionType(id="ct-1", name="postgres", provider="postgres")
+        client = DataConnectClient("localhost")
+        client._rest.update_connection_type = MagicMock(return_value=connection_type)  # type: ignore[method-assign]
+
+        client.update_connection_type("ct-1", tags=None)
+        request = client._rest.update_connection_type.call_args[0][1]
+        assert request.model_dump(exclude_unset=True) == {"tags": None}
+
+    def test_update_connection_type_tags_with_values(self) -> None:
+        from data_connect_hub.models import ConnectionType
+
+        connection_type = ConnectionType(id="ct-1", name="postgres", provider="postgres")
+        client = DataConnectClient("localhost")
+        client._rest.update_connection_type = MagicMock(return_value=connection_type)  # type: ignore[method-assign]
+
+        client.update_connection_type("ct-1", tags=["domain: database"])
+        request = client._rest.update_connection_type.call_args[0][1]
+        assert request.model_dump(exclude_unset=True) == {"tags": ["domain: database"]}
+
+    def test_update_connection_type_label_to_null(self) -> None:
+        from data_connect_hub.models import ConnectionType
+
+        connection_type = ConnectionType(id="ct-1", name="postgres", provider="postgres")
+        client = DataConnectClient("localhost")
+        client._rest.update_connection_type = MagicMock(return_value=connection_type)  # type: ignore[method-assign]
+
+        client.update_connection_type("ct-1", label=None)
+        request = client._rest.update_connection_type.call_args[0][1]
+        assert request.model_dump(exclude_unset=True) == {"label": None}
+
+    def test_update_connection_type_label_with_value(self) -> None:
+        from data_connect_hub.models import ConnectionType
+
+        connection_type = ConnectionType(id="ct-1", name="postgres", provider="postgres")
+        client = DataConnectClient("localhost")
+        client._rest.update_connection_type = MagicMock(return_value=connection_type)  # type: ignore[method-assign]
+
+        client.update_connection_type("ct-1", label="PostgreSQL Database")
+        request = client._rest.update_connection_type.call_args[0][1]
+        assert request.model_dump(exclude_unset=True) == {"label": "PostgreSQL Database"}
 
     def test_invalid_credential_test_request_is_sanitized(self) -> None:
         client = DataConnectClient("localhost")

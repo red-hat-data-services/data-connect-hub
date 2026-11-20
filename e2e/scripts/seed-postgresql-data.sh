@@ -54,27 +54,38 @@ if [[ "${PG_URL}" =~ sslmode=verify-(ca|full) ]]; then
     CA_B64="$(base64 -i "$CA_CERT_PATH" | tr -d '\n')"
 fi
 
-POD_NAME="e2e-pg-seed"
-# Proxy env only when we actually have a CA to verify with, so sslmode=require URLs
-# keep working unauthenticated (no PGSSLROOTCERT -> libpq honors sslmode).
-POD_ENVS=()
+POD_NAME="dch-e2e-pg-seed"
+# Proxy the CA env only when we actually have a CA to verify with, so
+# sslmode=require URLs keep working unauthenticated (no PGSSLROOTCERT ->
+# libpq honors sslmode).
+CA_ENV_YAML=""
 if [[ -n "${CA_B64:-}" ]]; then
-    POD_ENVS+=(--env="E2E_PG_CA_B64=${CA_B64}")
-    POD_ENVS+=(--env="PGSSLROOTCERT=/tmp/postgresql-ca.crt")
+    CA_ENV_YAML="        - name: E2E_PG_CA_B64
+          value: \"${CA_B64}\"
+        - name: PGSSLROOTCERT
+          value: /tmp/postgresql-ca.crt"
 fi
 
-kubectl delete pod "$POD_NAME" -n "$NAMESPACE" --ignore-not-found >/dev/null 2>&1 || true
-kubectl run "$POD_NAME" -n "$NAMESPACE" \
-    --image="$PG_IMAGE" \
-    --image-pull-policy=IfNotPresent \
-    --restart=Never \
-    ${POD_ENVS[@]+"${POD_ENVS[@]}"} \
-    --env="PGURI=${SEED_URL}" \
-    --command -- sh -c '
-        if [ -n "${E2E_PG_CA_B64:-}" ]; then
-            printf "%s" "$E2E_PG_CA_B64" | base64 -d > /tmp/postgresql-ca.crt
-        fi
-        psql "$PGURI" -v ON_ERROR_STOP=1 <<SQL
+# Use OpenShift's namespace-assigned base UID when available; fall back to a
+# non-root UID on non-OpenShift clusters where kubelet needs a numeric UID to
+# verify runAsNonRoot.
+RUN_AS_USER=$(kubectl get namespace "$NAMESPACE" \
+    -o jsonpath='{.metadata.annotations.openshift\.io/sa\.scc\.uid-range}' 2>/dev/null \
+    | cut -d/ -f1)
+: "${RUN_AS_USER:=1001}"
+
+# Stage the seed script in a temp file to avoid nested heredoc parsing issues
+# on Bash 3.2 (macOS).
+SEED_TMP="$(mktemp)"
+trap 'rm -f "$SEED_TMP"' EXIT
+cat > "$SEED_TMP" <<'SEED'
+# Fail the pod on any unexpected error (commands in "if" conditions are
+# exempt, which the optional pgvector probe below relies on).
+set -e
+if [ -n "${E2E_PG_CA_B64:-}" ]; then
+    printf "%s" "$E2E_PG_CA_B64" | base64 -d > /tmp/postgresql-ca.crt
+fi
+psql "$PGURI" -v ON_ERROR_STOP=1 <<SQL
 CREATE SCHEMA IF NOT EXISTS dch_e2e;
 DROP TABLE IF EXISTS dch_e2e.cities;
 CREATE TABLE dch_e2e.cities (
@@ -84,11 +95,94 @@ CREATE TABLE dch_e2e.cities (
     population INTEGER NOT NULL
 );
 INSERT INTO dch_e2e.cities (name, country, population) VALUES
-    ('"'"'Tokyo'"'"',  '"'"'Japan'"'"',          13960000),
-    ('"'"'London'"'"', '"'"'United Kingdom'"'"',  8982000),
-    ('"'"'Paris'"'"',  '"'"'France'"'"',          2161000);
+    ('Tokyo',  'Japan',          13960000),
+    ('London', 'United Kingdom',  8982000),
+    ('Paris',  'France',          2161000);
 SQL
-'
+
+# Optional pgvector seed data. test_flight_pgvector.py skips when
+# dch_e2e.embeddings is absent, so only warn when pgvector cannot be used.
+#
+# If pgvector is not installed, try to create it; it is not a trusted
+# extension, so this needs a superuser (hack/install-postgresql.sh --pgvector
+# pre-installs it). An unqualified CREATE EXTENSION installs into the current
+# schema. It is skipped when pgvector is already installed, possibly in
+# another schema, where IF NOT EXISTS would succeed without changing anything.
+#
+# Then seed only when vector, halfvec and sparsevec all resolve unqualified:
+# halfvec and sparsevec need pgvector >= 0.7.0, and DCH connects with the
+# same URI and user, so the e2e queries (type literals, the `<->` operator)
+# see the same default search_path as this session.
+version=$(psql "$PGURI" -v ON_ERROR_STOP=1 -tA -c "SELECT extversion FROM pg_extension WHERE extname = 'vector'")
+available=$(psql "$PGURI" -v ON_ERROR_STOP=1 -tA -c "SELECT 1 FROM pg_available_extensions WHERE name = 'vector'")
+if [ -z "$version" ] && [ -n "$available" ] &&
+    psql "$PGURI" -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS vector"; then
+    version=$(psql "$PGURI" -v ON_ERROR_STOP=1 -tA -c "SELECT extversion FROM pg_extension WHERE extname = 'vector'")
+fi
+# Drop unconditionally so a table seeded by an earlier run does not survive
+# a skip below and make the test fixture run against unresolvable types.
+psql "$PGURI" -v ON_ERROR_STOP=1 -c "DROP TABLE IF EXISTS dch_e2e.embeddings"
+resolved=$(psql "$PGURI" -v ON_ERROR_STOP=1 -tA -c "SELECT count(*) FROM unnest(ARRAY['vector', 'halfvec', 'sparsevec']) AS t(name) WHERE to_regtype(name) IS NOT NULL")
+if [ "$resolved" = "3" ]; then
+    psql "$PGURI" -v ON_ERROR_STOP=1 <<SQL
+CREATE TABLE dch_e2e.embeddings (
+    id               INTEGER PRIMARY KEY,
+    content          TEXT NOT NULL,
+    embedding        vector(3),
+    half_embedding   halfvec(3),
+    sparse_embedding sparsevec(5)
+);
+INSERT INTO dch_e2e.embeddings VALUES
+    (1, 'cat',   '[0.1,0.2,0.3]', '[1,2,3]', '{1:1.5,3:2.5}/5'),
+    (2, 'dog',   '[1,-2,3.5]',    '[4,5,6]', '{2:9}/5'),
+    (3, 'empty', NULL,            NULL,      NULL);
+SQL
+elif [ -n "$version" ]; then
+    echo "WARNING: pgvector ${version} is installed, but vector, halfvec and sparsevec do not all resolve" \
+        "(requires pgvector >= 0.7.0 in a schema on search_path); skipping dch_e2e.embeddings seed" >&2
+else
+    echo "WARNING: pgvector extension unavailable or not installable; skipping dch_e2e.embeddings seed" >&2
+fi
+SEED
+
+kubectl delete pod "$POD_NAME" -n "$NAMESPACE" --ignore-not-found >/dev/null 2>&1 || true
+
+kubectl apply -n "$NAMESPACE" -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${POD_NAME}
+spec:
+  restartPolicy: Never
+  # OpenShift namespaces enforce the PodSecurity "restricted" profile, which
+  # rejects pods that do not set an explicit securityContext.
+  securityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: seed
+      image: ${PG_IMAGE}
+      imagePullPolicy: IfNotPresent
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+        runAsNonRoot: true
+        runAsUser: ${RUN_AS_USER}
+        seccompProfile:
+          type: RuntimeDefault
+      env:
+        - name: PGURI
+          value: "${SEED_URL}"
+${CA_ENV_YAML}
+
+      command:
+        - /bin/sh
+        - -c
+        - |
+$(sed 's/^/          /' "$SEED_TMP")
+EOF
 
 kubectl wait --for=jsonpath='{.status.phase}'=Succeeded "pod/$POD_NAME" \
     -n "$NAMESPACE" --timeout=120s || {
@@ -96,4 +190,5 @@ kubectl wait --for=jsonpath='{.status.phase}'=Succeeded "pod/$POD_NAME" \
     echo "ERROR: seed pod '$POD_NAME' failed" >&2
     exit 1
 }
-kubectl delete pod "$POD_NAME" -n "$NAMESPACE" --ignore-not-found >/dev/null 2>&1 || true
+# Leave the completed seed pod in place for inspection; the next run deletes
+# and recreates it.

@@ -53,6 +53,7 @@ impl MetaStoreReader for S3TestMetaStore {
             },
             resource: DataConnection {
                 name: "test-s3".to_string(),
+                description: None,
                 data_connection_type_id: "s3-type".to_string(),
                 format: self.format.clone(),
                 credentials_ref: CredentialsRef {
@@ -85,9 +86,11 @@ impl MetaStoreReader for S3TestMetaStore {
             },
             resource: DataConnectionType {
                 name: "S3".to_string(),
+                label: Some("S3 compatible object storage".to_string()),
                 provider: "s3".to_string(),
                 description: Some("S3-compatible object storage".to_string()),
                 credentials_fields: vec![],
+                tags: None,
             },
             status: Default::default(),
         })
