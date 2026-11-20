@@ -88,13 +88,13 @@ arches:
     name: go-srpm-macros
     evr: 3.8.1-1.el9
     sourcerpm: go-rpm-macros-3.8.1-1.el9.src.rpm
-  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/aarch64/appstream/os/Packages/k/kernel-headers-5.14.0-741.22.1.el9_9.aarch64.rpm
+  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/aarch64/appstream/os/Packages/k/kernel-headers-5.14.0-741.24.1.el9_9.aarch64.rpm
     repoid: ubi-9-for-aarch64-appstream-rpms
-    size: 2729477
-    checksum: sha256:abed044d95e87ac1486ac817efc648f94d1c98221af5ccf6a109b08898952e4e
+    size: 2737597
+    checksum: sha256:35f606314a37ee00302bc02a7cb82606c296d2e030853973d61b11f01e038e88
     name: kernel-headers
-    evr: 5.14.0-741.22.1.el9_9
-    sourcerpm: kernel-5.14.0-741.22.1.el9_9.src.rpm
+    evr: 5.14.0-741.24.1.el9_9
+    sourcerpm: kernel-5.14.0-741.24.1.el9_9.src.rpm
   - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/aarch64/appstream/os/Packages/k/kernel-srpm-macros-1.0-16.el9.noarch.rpm
     repoid: ubi-9-for-aarch64-appstream-rpms
     size: 20832
@@ -1901,13 +1901,13 @@ arches:
     name: elfutils-libs
     evr: 0.195-1.el9
     sourcerpm: elfutils-0.195-1.el9.src.rpm
-  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/aarch64/baseos/os/Packages/e/expat-2.5.0-9.el9_9.4.aarch64.rpm
+  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/aarch64/baseos/os/Packages/e/expat-2.5.0-9.el9_9.8.aarch64.rpm
     repoid: ubi-9-for-aarch64-baseos-rpms
-    size: 123156
-    checksum: sha256:bcaa948dd26957b4633325ad07beae7074cceab75ad9f1ff664c244ecb40ca78
+    size: 128203
+    checksum: sha256:ff89a9d273790ed3623a3bc45484d819665503023df1157eb1a3e2bb0f7c1897
     name: expat
-    evr: 2.5.0-9.el9_9.4
-    sourcerpm: expat-2.5.0-9.el9_9.4.src.rpm
+    evr: 2.5.0-9.el9_9.8
+    sourcerpm: expat-2.5.0-9.el9_9.8.src.rpm
   - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/aarch64/baseos/os/Packages/f/file-5.39-19.el9.aarch64.rpm
     repoid: ubi-9-for-aarch64-baseos-rpms
     size: 55279
@@ -2192,13 +2192,13 @@ arches:
     name: go-srpm-macros
     evr: 3.8.1-1.el9
     sourcerpm: go-rpm-macros-3.8.1-1.el9.src.rpm
-  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/ppc64le/appstream/os/Packages/k/kernel-headers-5.14.0-741.22.1.el9_9.ppc64le.rpm
+  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/ppc64le/appstream/os/Packages/k/kernel-headers-5.14.0-741.24.1.el9_9.ppc64le.rpm
     repoid: ubi-9-for-ppc64le-appstream-rpms
-    size: 2753325
-    checksum: sha256:a0341f962637793192aae52de7e997c020bbf5346463b317c0a8d128487fdd9e
+    size: 2761377
+    checksum: sha256:c91d07f27d8a59d94b202cb0b4c55f2930e92a285571aef0e8557a83bdf63535
     name: kernel-headers
-    evr: 5.14.0-741.22.1.el9_9
-    sourcerpm: kernel-5.14.0-741.22.1.el9_9.src.rpm
+    evr: 5.14.0-741.24.1.el9_9
+    sourcerpm: kernel-5.14.0-741.24.1.el9_9.src.rpm
   - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/ppc64le/appstream/os/Packages/k/kernel-srpm-macros-1.0-16.el9.noarch.rpm
     repoid: ubi-9-for-ppc64le-appstream-rpms
     size: 20832
@@ -4005,13 +4005,13 @@ arches:
     name: elfutils-libs
     evr: 0.195-1.el9
     sourcerpm: elfutils-0.195-1.el9.src.rpm
-  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/ppc64le/baseos/os/Packages/e/expat-2.5.0-9.el9_9.4.ppc64le.rpm
+  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/ppc64le/baseos/os/Packages/e/expat-2.5.0-9.el9_9.8.ppc64le.rpm
     repoid: ubi-9-for-ppc64le-baseos-rpms
-    size: 133945
-    checksum: sha256:494d3f75e906f24f4161ce474230ee04a8421b1285ee9f968427dab8b9e1a594
+    size: 141630
+    checksum: sha256:b1df83db6dea87d184fbe0a066f50d8fe507371544312cb5f10677bdcddbbbfe
     name: expat
-    evr: 2.5.0-9.el9_9.4
-    sourcerpm: expat-2.5.0-9.el9_9.4.src.rpm
+    evr: 2.5.0-9.el9_9.8
+    sourcerpm: expat-2.5.0-9.el9_9.8.src.rpm
   - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/ppc64le/baseos/os/Packages/f/file-5.39-19.el9.ppc64le.rpm
     repoid: ubi-9-for-ppc64le-baseos-rpms
     size: 55501
@@ -4303,13 +4303,13 @@ arches:
     name: go-srpm-macros
     evr: 3.8.1-1.el9
     sourcerpm: go-rpm-macros-3.8.1-1.el9.src.rpm
-  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/s390x/appstream/os/Packages/k/kernel-headers-5.14.0-741.22.1.el9_9.s390x.rpm
+  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/s390x/appstream/os/Packages/k/kernel-headers-5.14.0-741.24.1.el9_9.s390x.rpm
     repoid: ubi-9-for-s390x-appstream-rpms
-    size: 2759505
-    checksum: sha256:56558e84ee23f5088d7bec4382c26ec6962584bc780fba7be7004f423166a5b6
+    size: 2767621
+    checksum: sha256:c81f4ada8934cc4ac0761e1a7b8217639d4483c43ebfbfdb9c8b216413e3c9eb
     name: kernel-headers
-    evr: 5.14.0-741.22.1.el9_9
-    sourcerpm: kernel-5.14.0-741.22.1.el9_9.src.rpm
+    evr: 5.14.0-741.24.1.el9_9
+    sourcerpm: kernel-5.14.0-741.24.1.el9_9.src.rpm
   - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/s390x/appstream/os/Packages/k/kernel-srpm-macros-1.0-16.el9.noarch.rpm
     repoid: ubi-9-for-s390x-appstream-rpms
     size: 20832
@@ -6116,13 +6116,13 @@ arches:
     name: elfutils-libs
     evr: 0.195-1.el9
     sourcerpm: elfutils-0.195-1.el9.src.rpm
-  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/s390x/baseos/os/Packages/e/expat-2.5.0-9.el9_9.4.s390x.rpm
+  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/s390x/baseos/os/Packages/e/expat-2.5.0-9.el9_9.8.s390x.rpm
     repoid: ubi-9-for-s390x-baseos-rpms
-    size: 125235
-    checksum: sha256:905c0cc4f85571df533a582fd689cdef3049a769dc8ca3030f5f701b1de4083c
+    size: 129904
+    checksum: sha256:5e89ea1adff6edd438af9c0132480b7ff2f0406c1497a5d1d32f6f714e045677
     name: expat
-    evr: 2.5.0-9.el9_9.4
-    sourcerpm: expat-2.5.0-9.el9_9.4.src.rpm
+    evr: 2.5.0-9.el9_9.8
+    sourcerpm: expat-2.5.0-9.el9_9.8.src.rpm
   - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/s390x/baseos/os/Packages/f/file-5.39-19.el9.s390x.rpm
     repoid: ubi-9-for-s390x-baseos-rpms
     size: 54955
@@ -6414,13 +6414,13 @@ arches:
     name: go-srpm-macros
     evr: 3.8.1-1.el9
     sourcerpm: go-rpm-macros-3.8.1-1.el9.src.rpm
-  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/appstream/os/Packages/k/kernel-headers-5.14.0-741.22.1.el9_9.x86_64.rpm
+  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/appstream/os/Packages/k/kernel-headers-5.14.0-741.24.1.el9_9.x86_64.rpm
     repoid: ubi-9-for-x86_64-appstream-rpms
-    size: 2768777
-    checksum: sha256:0b47eff696c4ea2fe0a7088365d19cbaff5dc3580bb35e3908298c833311b86d
+    size: 2776853
+    checksum: sha256:fa32ef8311cd60127da5f4b38f15b30d51f2f50c146124b9e1b6ab7028ea39d6
     name: kernel-headers
-    evr: 5.14.0-741.22.1.el9_9
-    sourcerpm: kernel-5.14.0-741.22.1.el9_9.src.rpm
+    evr: 5.14.0-741.24.1.el9_9
+    sourcerpm: kernel-5.14.0-741.24.1.el9_9.src.rpm
   - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/appstream/os/Packages/k/kernel-srpm-macros-1.0-16.el9.noarch.rpm
     repoid: ubi-9-for-x86_64-appstream-rpms
     size: 20832
@@ -8220,13 +8220,13 @@ arches:
     name: elfutils-libs
     evr: 0.195-1.el9
     sourcerpm: elfutils-0.195-1.el9.src.rpm
-  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/baseos/os/Packages/e/expat-2.5.0-9.el9_9.4.x86_64.rpm
+  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/baseos/os/Packages/e/expat-2.5.0-9.el9_9.8.x86_64.rpm
     repoid: ubi-9-for-x86_64-baseos-rpms
-    size: 129305
-    checksum: sha256:9e8c9375b2d88064de2dbaff424a72a913bb0c2809c6cddb48d00cd2176e61ee
+    size: 132507
+    checksum: sha256:86b667aa4d1254fe4fbc0dd2febadba3e020f40e5c460d3245c606397eedcbfe
     name: expat
-    evr: 2.5.0-9.el9_9.4
-    sourcerpm: expat-2.5.0-9.el9_9.4.src.rpm
+    evr: 2.5.0-9.el9_9.8
+    sourcerpm: expat-2.5.0-9.el9_9.8.src.rpm
   - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/baseos/os/Packages/f/file-5.39-19.el9.x86_64.rpm
     repoid: ubi-9-for-x86_64-baseos-rpms
     size: 55304
