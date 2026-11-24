@@ -46,7 +46,7 @@ done
 
 for file in services/rest/Containerfile.konflux \
 	services/flight/Containerfile.konflux \
-	dc-controller/Dockerfile.konflux; do
+	dc-controller/Containerfile.konflux; do
 	replace "$file" 'ubi-minimal-pqc@sha256:[0-9a-f]{64}' "ubi-minimal-pqc@${ubi_minimal_pqc_digest}"
 done
 
@@ -54,4 +54,4 @@ git diff --stat -- services/rest/Containerfile \
 	services/flight/Containerfile \
 	services/rest/Containerfile.konflux \
 	services/flight/Containerfile.konflux \
-	dc-controller/Dockerfile.konflux
+	dc-controller/Containerfile.konflux
