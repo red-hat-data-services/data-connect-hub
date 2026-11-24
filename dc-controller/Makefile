@@ -124,11 +124,11 @@ run: manifests generate fmt vet ## Run a controller from your host.
 # More info: https://docs.docker.com/develop/develop-images/build_enhancements/
 .PHONY: docker-build
 docker-build: ## Build docker image with the manager.
-	$(CONTAINER_TOOL) build -t ${IMG} -f Dockerfile.konflux ..
+	$(CONTAINER_TOOL) build -t ${IMG} -f Containerfile.konflux ..
 
 .PHONY: docker-build-e2e
 docker-build-e2e: ## Build the manager image for E2E tests with a public runtime base.
-	$(CONTAINER_TOOL) build --build-arg RUNTIME_BASE_IMAGE=registry.access.redhat.com/ubi9/ubi-minimal -t ${IMG} -f Dockerfile.konflux ..
+	$(CONTAINER_TOOL) build --build-arg RUNTIME_BASE_IMAGE=registry.access.redhat.com/ubi9/ubi-minimal -t ${IMG} -f Containerfile.konflux ..
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
@@ -143,7 +143,7 @@ docker-push: ## Push docker image with the manager.
 PLATFORMS ?= linux/arm64,linux/amd64,linux/s390x,linux/ppc64le
 .PHONY: docker-buildx
 docker-buildx: ## Build and push docker image for the manager for cross-platform support
-	sed -e '1 s/\(^FROM\)/FROM --platform=\$$\{BUILDPLATFORM\}/; t' -e ' 1,// s//FROM --platform=\$$\{BUILDPLATFORM\}/' Dockerfile.konflux > Containerfile.cross
+	sed -e '1 s/\(^FROM\)/FROM --platform=\$$\{BUILDPLATFORM\}/; t' -e ' 1,// s//FROM --platform=\$$\{BUILDPLATFORM\}/' Containerfile.konflux > Containerfile.cross
 	- $(CONTAINER_TOOL) buildx create --name dc-controller-builder
 	$(CONTAINER_TOOL) buildx use dc-controller-builder
 	- $(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) --tag ${IMG} -f Containerfile.cross .
