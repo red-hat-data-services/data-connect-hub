@@ -9,11 +9,13 @@ USER root
 WORKDIR /workspace
 
 COPY dc-controller/go.mod dc-controller/go.sum ./
-RUN go mod download
+RUN if [ -f /cachi2/cachi2.env ]; then . /cachi2/cachi2.env; fi && \
+    go mod download
 
 COPY dc-controller/ .
 
-RUN CGO_ENABLED=${CGO_ENABLED} GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+RUN if [ -f /cachi2/cachi2.env ]; then . /cachi2/cachi2.env; fi && \
+    CGO_ENABLED=${CGO_ENABLED} GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     GOEXPERIMENT=strictfipsruntime \
     go build -a -o manager cmd/main.go
 
