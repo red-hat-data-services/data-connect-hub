@@ -30,7 +30,7 @@ sed -E -i.bak 's/^([[:space:]]*imagePullPolicy:).*/\1 IfNotPresent/' \
 rm -f "$CI_REPO_ROOT/config/base/rest-service/deployment.yaml.bak"
 docker build \
     --build-arg "RUNTIME_BASE_IMAGE=${CI_E2E_RUNTIME_BASE_IMAGE}" \
-    -t "$CI_CONTROLLER_IMAGE" -f "$CI_REPO_ROOT/dc-controller/Containerfile.konflux" "$CI_REPO_ROOT"
+    -t "$CI_CONTROLLER_IMAGE" -f "$CI_REPO_ROOT/dc-controller/Dockerfile.konflux" "$CI_REPO_ROOT"
 
 # ===================================================================
 # Load images into kind

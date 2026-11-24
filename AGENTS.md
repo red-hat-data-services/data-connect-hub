@@ -153,7 +153,7 @@ make container-rest     # rest-service image
 make container-all      # both service images
 ```
 
-The dc-controller has its own `Containerfile.konflux`
+The dc-controller has its own `Dockerfile.konflux`
 and is built from its own Makefile:
 
 ```console
