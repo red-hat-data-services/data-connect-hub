@@ -161,10 +161,10 @@ type platformConfig struct {
 	TokenReviewAudiences []string
 }
 
-// readPlatformConfig reads cluster-level defaults from the platform ConfigMap.
-// TODO(DSC): When DCH is onboarded to DSC, the platform operator will create
-// and manage this ConfigMap (including auth.tokenReviewAudiences) in the operand
-// namespace. Until then, standalone users create it manually or use CR overrides.
+// readPlatformConfig reads application defaults and runtime metadata from the
+// ConfigMap in the application's namespace. Standalone users supply it directly;
+// the planned Data-module integration delegates its management to the module
+// operator. Explicit gateway and audience fields in the application spec win.
 func (r *DataConnectServiceReconciler) readPlatformConfig(ctx context.Context, namespace string) platformConfig {
 	cfg := platformConfig{
 		Distribution: dchv1alpha1.DistributionStatus{
@@ -212,13 +212,19 @@ func (r *DataConnectServiceReconciler) readPlatformConfig(ctx context.Context, n
 // +kubebuilder:rbac:groups=dataconnecthub.opendatahub.io,resources=dataconnectservices,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=dataconnecthub.opendatahub.io,resources=dataconnectservices/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=dataconnecthub.opendatahub.io,resources=dataconnectservices/finalizers,verbs=update
+// +kubebuilder:rbac:groups=dataconnecthub.opendatahub.io,resources=initdataconnectiontypes,verbs=create
 // DCH data plane resources are checked by SubjectAccessReview only. The
 // controller needs the union of (1) the verbs kube-rbac-proxy checks for its
 // own REST calls (create/list connection types, create connections, register
 // flight services) and (2) every rule in the ClusterRoles it installs from
 // config/base (dch-read, dch-read-write, dch-admin, rest-service-data-access),
 // because RBAC escalation prevention requires holding a permission to grant it.
-// Keep these in sync with config/base/user-roles/clusterroles.yaml.
+// The same applies to the RoleBindings the tenant and global namespace
+// controllers create: holding every rule of the bound ClusterRoles (including
+// the secrets verbs of the *-secret-access roles, granted by the secrets marker
+// below) is what lets them bind without the `bind` verb.
+// Keep these in sync with config/base/user-roles/clusterroles.yaml and the
+// *-secret-access ClusterRoles under config/base.
 // +kubebuilder:rbac:groups=dataconnecthub.opendatahub.io,resources=data-connections;data-connection-types,verbs=get;create;patch;delete
 // +kubebuilder:rbac:groups=dataconnecthub.opendatahub.io,resources=data-store,verbs=get
 // +kubebuilder:rbac:groups=dataconnecthub.opendatahub.io,resources=flight-services,verbs=create
@@ -399,15 +405,17 @@ func (r *DataConnectServiceReconciler) updateStatus(
 	cr.Status.ObservedGeneration = cr.Generation
 	cr.Status.Distribution = platCfg.Distribution
 	mutate(&cr)
-	// The gateway check may change Ready to Not Ready. Base the platform
-	// release handshake on the final status rather than the requested phase.
-	cr.Status.Releases = r.buildReleases(&cr, platCfg, cr.Status.Phase == conditionTypeReady)
+	// Final checks (for example gateway HTTP/2 support) can override Ready.
+	// Acknowledge an upgrade only after those checks, preserving the previous
+	// platform release while the application is not ready.
+	ready := meta.IsStatusConditionTrue(cr.Status.Conditions, conditionTypeReady)
+	cr.Status.Releases = r.buildReleases(&cr, platCfg, ready)
 
 	if err := r.Status().Update(ctx, &cr); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	if phase == conditionTypeReady {
+	if ready {
 		return ctrl.Result{RequeueAfter: requeueWhenReady}, nil
 	}
 	if phase == "Error" {
@@ -654,6 +662,12 @@ func (r *DataConnectServiceReconciler) ensureInitDataConnectionTypes(ctx context
 				Namespace: cr.Namespace,
 			},
 			Spec: spec.toIDCTSpec(),
+		}
+		// The owner reference lets GC remove the IDCTs with the CR even if
+		// the finalizer's explicit cleanup is skipped.
+		if err := controllerutil.SetControllerReference(cr, idct, r.Scheme); err != nil {
+			log.Error(err, "failed to set owner reference on InitDataConnectionType", "name", name)
+			continue
 		}
 		if err := r.Create(ctx, idct); err != nil {
 			if !apierrors.IsAlreadyExists(err) {
@@ -1163,7 +1177,7 @@ func (r *DataConnectServiceReconciler) SetupWithManager(mgr ctrl.Manager) error 
 
 func (r *DataConnectServiceReconciler) platformConfigToReconcile(ctx context.Context, obj client.Object) []reconcile.Request {
 	var list dchv1alpha1.DataConnectServiceList
-	if err := r.List(ctx, &list); err != nil {
+	if err := r.List(ctx, &list, client.InNamespace(obj.GetNamespace())); err != nil {
 		logf.FromContext(ctx).Error(err, "failed to list DataConnectService CRs for ConfigMap trigger")
 		return nil
 	}
