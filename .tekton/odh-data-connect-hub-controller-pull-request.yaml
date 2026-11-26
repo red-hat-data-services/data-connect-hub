@@ -8,13 +8,13 @@ metadata:
     pipelines.appstudio.openshift.io/type: build
   namespace: rhoai-tenant
   annotations:
+    pipelinesascode.tekton.dev/on-comment: "^/build-konflux"
     build.appstudio.openshift.io/repo: "https://github.com/red-hat-data-services/data-connect-hub?rev={{revision}}"
     build.appstudio.redhat.com/commit_sha: "{{revision}}"
     build.appstudio.redhat.com/target_branch: "{{target_branch}}"
     build.appstudio.redhat.com/pull_request_number: "{{pull_request_number}}"
     pipelinesascode.tekton.dev/max-keep-runs: "3"
     pipelinesascode.tekton.dev/cancel-in-progress: "true"
-    pipelinesascode.tekton.dev/on-comment: "^/build-konflux"
     pipelinesascode.tekton.dev/on-cel-expression: |-
       event == "pull_request"
       && target_branch == "rhoai-3.7-ea.1"
@@ -34,6 +34,8 @@ spec:
     value: .
   - name: hermetic
     value: true
+  - name: prefetch-input
+    value: '[{"type":"gomod","path":"dc-controller"}]'
   - name: rhoai-version
     value: "3.7.0-ea.1"
 
