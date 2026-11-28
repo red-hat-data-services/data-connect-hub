@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 
 from pydantic import ValidationError
 
+from ._fips import enforce_client_fips, enforce_flight_fips, resolve_require_fips
 from ._rest import RestClient
 from .exceptions import DCHConfigError
 from .models import (
@@ -82,6 +83,25 @@ def _build_urls(endpoint: str) -> tuple[str, str]:
     return f"https://{netloc}", f"grpc+tls://{netloc}"
 
 
+def _flight_import_error(exc: ImportError) -> DCHConfigError:
+    """Explain why ``_flight`` failed to import.
+
+    Only a missing pyarrow package means the ``flight`` extra isn't installed.
+    Any other failure comes from an installed pyarrow that can't load, e.g.
+    Red Hat pyarrow missing system libraries such as ``libthrift`` outside an
+    RHOAI or AIPCC image; pointing at the extra would send users in circles.
+    """
+    if isinstance(exc, ModuleNotFoundError) and exc.name == "pyarrow":
+        return DCHConfigError(
+            "Flight SQL support requires the 'flight' extra: pip install \"data-connect-hub[flight]\""
+        )
+    return DCHConfigError(
+        f"pyarrow is installed but failed to load: {type(exc).__name__}: {exc}. "
+        "Red Hat pyarrow builds need the system libraries shipped in RHOAI workbench "
+        "and AIPCC base images; data_connect_hub.fips_status() reports the installed build."
+    )
+
+
 class DataConnectClient:
     """Single entry point for all DCH interactions.
 
@@ -117,7 +137,18 @@ class DataConnectClient:
     backoff_max : float
         Maximum backoff delay in seconds (default 30.0).
     flight_timeout : float, optional
-        Timeout in seconds for Flight SQL RPC calls.
+        Deadline in seconds for each Flight SQL RPC.  For queries, the deadline
+        covers the whole result stream.
+    require_fips : bool, optional
+        Fail instead of running TLS outside the host's FIPS-validated
+        OpenSSL.  When set, creating the client raises
+        :class:`DCHConfigError` unless the host is in FIPS mode and Python's
+        ``ssl`` uses the system OpenSSL with the FIPS provider enforced, and
+        the first Flight call raises it unless ``pyarrow.flight`` uses the
+        system OpenSSL (e.g. pyarrow from the Red Hat AI Python index).
+        ``insecure=True`` emits a :class:`DCHFipsWarning`.  Defaults to the
+        ``DCH_REQUIRE_FIPS`` environment variable (``1``/``true``/``yes``/
+        ``on``), else False.  See :func:`fips_status`.
     """
 
     def __init__(
@@ -135,6 +166,7 @@ class DataConnectClient:
         backoff_base: float = 0.5,
         backoff_max: float = 30.0,
         flight_timeout: float | None = None,
+        require_fips: bool | None = None,
     ) -> None:
         if token and token_provider:
             raise DCHConfigError(
@@ -143,6 +175,10 @@ class DataConnectClient:
             )
 
         rest_url, flight_url = _build_urls(endpoint)
+
+        self._require_fips = resolve_require_fips(require_fips)
+        if self._require_fips:
+            enforce_client_fips(insecure=insecure)
 
         self._rest = RestClient(
             url=rest_url,
@@ -158,10 +194,9 @@ class DataConnectClient:
             backoff_max=backoff_max,
         )
 
-        # Built on first use: ``_flight`` imports pyarrow and
-        # adbc-driver-flightsql at module scope, which only the ``[flight]``
-        # extra installs.  Deferring the import keeps the package importable
-        # on a REST-only install.
+        # Built on first use: ``_flight`` imports pyarrow at module scope,
+        # which only the ``[flight]`` extra installs.  Deferring the import
+        # keeps the package importable on a REST-only install.
         self._flight: FlightClient | None = None
         self._flight_kwargs: dict[str, Any] = {
             "url": flight_url,
@@ -178,9 +213,9 @@ class DataConnectClient:
             try:
                 from ._flight import FlightClient
             except ImportError as exc:
-                raise DCHConfigError(
-                    "Flight SQL support requires the 'flight' extra: pip install \"data-connect-hub[flight]\""
-                ) from exc
+                raise _flight_import_error(exc) from exc
+            if self._require_fips:
+                enforce_flight_fips()
             self._flight = FlightClient(**self._flight_kwargs)
         return self._flight
 
@@ -215,12 +250,14 @@ class DataConnectClient:
         credentials_ref: CredentialsRef | None = None,
         credentials: InlineCredentials | None = None,
         properties: dict[str, str] | None = None,
+        description: str | None = None,
     ) -> DataConnection:
         if (credentials_ref is None) == (credentials is None):
             raise DCHConfigError("exactly one of credentials_ref or credentials must be provided")
         try:
             req = CreateConnectionRequest(
                 name=name,
+                description=description,
                 data_connection_type_id=connection_type_id,
                 format=data_format,
                 credentials_ref=credentials_ref,
@@ -240,16 +277,27 @@ class DataConnectClient:
         data_format: DataFormat | None = None,
         credentials_ref: CredentialsRef | None = None,
         properties: dict[str, str] | None = None,
+        description: str | _UnsetType | None = _UNSET,
     ) -> DataConnection:
-        if all(v is None for v in (name, connection_type_id, data_format, credentials_ref, properties)):
+        """Update a connection; pass ``description=None`` to clear it."""
+        if description is _UNSET and all(
+            v is None for v in (name, connection_type_id, data_format, credentials_ref, properties)
+        ):
             raise DCHConfigError("at least one field must be provided for update")
-        req = UpdateConnectionRequest(
-            name=name,
-            data_connection_type_id=connection_type_id,
-            format=data_format,
-            credentials_ref=credentials_ref,
-            properties=properties,
-        )
+        updates: dict[str, object] = {}
+        if name is not None:
+            updates["name"] = name
+        if description is not _UNSET:
+            updates["description"] = description
+        if connection_type_id is not None:
+            updates["data_connection_type_id"] = connection_type_id
+        if data_format is not None:
+            updates["format"] = data_format
+        if credentials_ref is not None:
+            updates["credentials_ref"] = credentials_ref
+        if properties is not None:
+            updates["properties"] = properties
+        req = UpdateConnectionRequest.model_validate(updates)
         return self._rest.update_connection(connection_id, req)
 
     def delete_connection(self, connection_id: str) -> None:
@@ -285,14 +333,18 @@ class DataConnectClient:
         *,
         name: str,
         provider: str,
+        label: str | None = None,
         description: str | None = None,
         credentials_fields: list[CredentialField] | None = None,
+        tags: list[str] | None = None,
     ) -> ConnectionType:
         req = CreateConnectionTypeRequest(
             name=name,
+            label=label,
             provider=provider,
             description=description,
             credentials_fields=credentials_fields or [],
+            tags=tags,
         )
         return self._rest.create_connection_type(req)
 
@@ -301,23 +353,36 @@ class DataConnectClient:
         type_id: str,
         *,
         name: str | None = None,
+        label: str | _UnsetType | None = _UNSET,
         provider: str | None = None,
         description: str | _UnsetType | None = _UNSET,
         credentials_fields: list[CredentialField] | None = None,
+        tags: list[str] | _UnsetType | None = _UNSET,
     ) -> ConnectionType:
-        """Update a connection type; pass ``description=None`` to clear it."""
-        if name is None and provider is None and description is _UNSET and credentials_fields is None:
+        """Update a connection type; pass ``description=None``, ``label=None``, or ``tags=None`` to clear them."""
+        if (
+            name is None
+            and label is _UNSET
+            and provider is None
+            and description is _UNSET
+            and credentials_fields is None
+            and tags is _UNSET
+        ):
             raise DCHConfigError("at least one field must be provided for update")
 
         updates: dict[str, object] = {}
         if name is not None:
             updates["name"] = name
+        if label is not _UNSET:
+            updates["label"] = label
         if provider is not None:
             updates["provider"] = provider
         if description is not _UNSET:
             updates["description"] = description
         if credentials_fields is not None:
             updates["credentials_fields"] = credentials_fields
+        if tags is not _UNSET:
+            updates["tags"] = tags
         req = UpdateConnectionTypeRequest.model_validate(updates)
         return self._rest.update_connection_type(type_id, req)
 

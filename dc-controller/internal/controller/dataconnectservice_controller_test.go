@@ -18,8 +18,10 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"slices"
+	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -34,6 +36,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -41,6 +44,17 @@ import (
 
 	dchv1alpha1 "github.com/opendatahub-io/data-connect-hub/dc-controller/api/dataconnecthub/v1alpha1"
 )
+
+type denyInitDataConnectionTypeDeletes struct {
+	client.Client
+}
+
+func (c denyInitDataConnectionTypeDeletes) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
+	if _, ok := obj.(*dchv1alpha1.InitDataConnectionType); ok {
+		return fmt.Errorf("injected InitDataConnectionType delete failure")
+	}
+	return c.Client.Delete(ctx, obj, opts...)
+}
 
 var _ = Describe("DataConnectService Controller", func() {
 	const (
@@ -50,8 +64,10 @@ var _ = Describe("DataConnectService Controller", func() {
 		testFlightImage = "quay.io/opendatahub/odh-data-connect-hub-flight:odh-stable"
 
 		// Kustomize adds this prefix to all resource names.
-		np                 = "dch-"
-		flightResourceName = np + resourceName + "-flight"
+		np                  = "dch-"
+		flightResourceName  = np + resourceName + "-flight"
+		controllerNamespace = "controller-ns"
+		rhoaiGatewayNS      = "openshift-ingress"
 	)
 
 	ctx := context.Background()
@@ -60,14 +76,48 @@ var _ = Describe("DataConnectService Controller", func() {
 
 	manifestsPath := filepath.Join("..", "..", "..", "config")
 
+	// globalNamespaceConfig is the feature configuration reconciler() uses;
+	// specs that enable it reset it afterwards.
+	var globalNamespaceConfig GlobalNamespaceConfig
+
 	reconciler := func() *DataConnectServiceReconciler {
 		return &DataConnectServiceReconciler{
-			Client:             k8sClient,
-			Scheme:             k8sClient.Scheme(),
-			ManifestsPath:      manifestsPath,
-			RestImage:          testRestImage,
-			FlightImage:        testFlightImage,
-			KubeRbacProxyImage: "quay.io/opendatahub/odh-kube-rbac-proxy:odh-stable",
+			Client:                k8sClient,
+			Scheme:                k8sClient.Scheme(),
+			ManifestsPath:         manifestsPath,
+			RestImage:             testRestImage,
+			FlightImage:           testFlightImage,
+			KubeRbacProxyImage:    "quay.io/opendatahub/odh-kube-rbac-proxy:odh-stable",
+			ControllerNamespace:   controllerNamespace,
+			GlobalNamespaceConfig: globalNamespaceConfig,
+			APIReader:             k8sClient,
+		}
+	}
+
+	expectPolicyNamespace := func(name string, ingressIndex int, namespace string) {
+		policy := &networkingv1.NetworkPolicy{}
+		key := types.NamespacedName{Name: name, Namespace: targetNamespace}
+		ExpectWithOffset(1, k8sClient.Get(ctx, key, policy)).To(Succeed())
+		ExpectWithOffset(1, policy.Spec.Ingress[ingressIndex].From[0].NamespaceSelector.MatchLabels).
+			To(HaveKeyWithValue("kubernetes.io/metadata.name", namespace))
+	}
+
+	expectGatewayPolicy := func(gatewayName, gatewayNamespace string) {
+		for _, tc := range []struct {
+			name         string
+			ingressIndex int
+		}{
+			{np + nameRestService, 0},
+			{flightResourceName, 1},
+		} {
+			policy := &networkingv1.NetworkPolicy{}
+			key := types.NamespacedName{Name: tc.name, Namespace: targetNamespace}
+			ExpectWithOffset(1, k8sClient.Get(ctx, key, policy)).To(Succeed())
+			peer := policy.Spec.Ingress[tc.ingressIndex].From[0]
+			ExpectWithOffset(1, peer.NamespaceSelector.MatchLabels).
+				To(HaveKeyWithValue("kubernetes.io/metadata.name", gatewayNamespace))
+			ExpectWithOffset(1, peer.PodSelector.MatchLabels).
+				To(HaveKeyWithValue("gateway.networking.k8s.io/gateway-name", gatewayName))
 		}
 	}
 
@@ -81,12 +131,19 @@ var _ = Describe("DataConnectService Controller", func() {
 	}
 
 	cleanupOperatorResources := func() {
+		var idcts dchv1alpha1.InitDataConnectionTypeList
+		if err := k8sClient.List(ctx, &idcts, client.InNamespace(targetNamespace)); err == nil {
+			for i := range idcts.Items {
+				_ = k8sClient.Delete(ctx, &idcts.Items[i])
+			}
+		}
 		for _, name := range []string{np + nameRestService, flightResourceName} {
 			_ = k8sClient.Delete(ctx, &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: targetNamespace}})
 			_ = k8sClient.Delete(ctx, &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: targetNamespace}})
 			_ = k8sClient.Delete(ctx, &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: targetNamespace}})
 		}
 		for _, name := range []string{
+			np + "params",
 			np + nameRestService + "-config",
 			flightResourceName + "-config",
 			np + nameRestService + "-kube-rbac-proxy-config",
@@ -104,6 +161,8 @@ var _ = Describe("DataConnectService Controller", func() {
 			_ = k8sClient.Delete(ctx, &rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: name}})
 		}
 		_ = k8sClient.Delete(ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: platformConfigName, Namespace: targetNamespace}})
+		// envtest runs no garbage collector, so owned IDCTs outlive the CR.
+		_ = k8sClient.DeleteAllOf(ctx, &dchv1alpha1.InitDataConnectionType{}, client.InNamespace(targetNamespace))
 	}
 
 	deleteCR := func() {
@@ -285,12 +344,150 @@ var _ = Describe("DataConnectService Controller", func() {
 			Expect(ready.Status).To(Equal(metav1.ConditionTrue))
 		})
 
+		It("should set the CR as controller owner of created InitDataConnectionTypes", func() {
+			_, err := reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: crKey})
+			Expect(err).NotTo(HaveOccurred())
+
+			cr := &dchv1alpha1.DataConnectService{}
+			Expect(k8sClient.Get(ctx, crKey, cr)).To(Succeed())
+
+			var list dchv1alpha1.InitDataConnectionTypeList
+			Expect(k8sClient.List(ctx, &list, client.InNamespace(targetNamespace))).To(Succeed())
+			Expect(list.Items).NotTo(BeEmpty())
+			for i := range list.Items {
+				owner := metav1.GetControllerOf(&list.Items[i])
+				Expect(owner).NotTo(BeNil(), "IDCT %s has no controller owner", list.Items[i].Name)
+				Expect(owner.UID).To(Equal(cr.UID))
+				Expect(owner.Kind).To(Equal("DataConnectService"))
+			}
+		})
+
 		It("should add managed-by label to created resources", func() {
 			reconcileUntilReady()
 
 			deploy := &appsv1.Deployment{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: np + nameRestService, Namespace: targetNamespace}, deploy)).To(Succeed())
 			Expect(deploy.Labels).To(HaveKeyWithValue(labelManagedBy, managedByDCHService))
+		})
+
+		It("should use the default gateway name and namespace in both policies", func() {
+			_, err := reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: crKey})
+			Expect(err).NotTo(HaveOccurred())
+			expectGatewayPolicy(defaultGatewayName, defaultGatewayNamespace)
+		})
+
+		It("should use explicit source namespaces for service ingress", func() {
+			_, err := reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: crKey})
+			Expect(err).NotTo(HaveOccurred())
+			expectPolicyNamespace(np+nameRestService, 1, controllerNamespace)
+			expectPolicyNamespace(flightResourceName, 0, targetNamespace)
+		})
+
+		It("should project Intermediate TLS defaults onto kube-rbac-proxy without the OpenShift config API", func() {
+			// The envtest cluster is vanilla Kubernetes: the config.openshift.io
+			// API is genuinely unavailable, so the profile resolution falls
+			// back to Intermediate and the caller must still project hardened
+			// TLS options onto the applied proxy deployment.
+			reconcileUntilReady()
+
+			deploy := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: np + nameRestService, Namespace: targetNamespace}, deploy)).To(Succeed())
+			proxy := findContainer(deploy, nameKubeRbacProxy)
+			Expect(proxy).NotTo(BeNil())
+
+			Expect(slices.Contains(proxy.Args, "--tls-min-version=VersionTLS12")).To(BeTrue(),
+				"expected the Intermediate minimum on kube-rbac-proxy without the OpenShift config API")
+			Expect(slices.ContainsFunc(proxy.Args, func(arg string) bool {
+				return strings.HasPrefix(arg, "--tls-cipher-suites=TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256")
+			})).To(BeTrue(), "expected Intermediate cipher suites on kube-rbac-proxy")
+		})
+
+		It("should project the Intermediate TLS profile onto the flight-service configmap without the OpenShift config API", func() {
+			// Caller-level fallback pin for the Flight listener: the envtest
+			// cluster is vanilla Kubernetes, so profile resolution falls back
+			// to Intermediate and the flight configmap must still carry the
+			// projected policy for the rustls acceptor to enforce.
+			reconcileUntilReady()
+
+			cm := &corev1.ConfigMap{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: flightResourceName + "-config", Namespace: targetNamespace}, cm)).To(Succeed())
+			var flightConfigTOML map[string]any
+			Expect(toml.Unmarshal([]byte(cm.Data["config.toml"]), &flightConfigTOML)).To(Succeed())
+			tls, ok := flightConfigTOML["tls"].(map[string]any)
+			Expect(ok).To(BeTrue(), "expected [tls] section in flight config")
+			Expect(tls["min_version"]).To(Equal("VersionTLS12"))
+			ciphers, ok := tls["ciphers"].([]any)
+			Expect(ok).To(BeTrue(), "expected projected cipher suites in flight config")
+			Expect(ciphers).To(ContainElement("TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256"))
+		})
+	})
+
+	Context("When global namespaces are labeled", func() {
+		const (
+			labelKey = "test.dataconnecthub.opendatahub.io/status-global"
+			globalNS = "dcs-status-global"
+		)
+
+		setLabel := func(labeled bool) {
+			ns := &corev1.Namespace{}
+			ExpectWithOffset(1, k8sClient.Get(ctx, types.NamespacedName{Name: globalNS}, ns)).To(Succeed())
+			if ns.Labels == nil {
+				ns.Labels = map[string]string{}
+			}
+			if labeled {
+				ns.Labels[labelKey] = globalNS
+			} else {
+				delete(ns.Labels, labelKey)
+			}
+			ExpectWithOffset(1, k8sClient.Update(ctx, ns)).To(Succeed())
+		}
+
+		restTenantIDs := func() []any {
+			cm := &corev1.ConfigMap{}
+			ExpectWithOffset(1, k8sClient.Get(ctx, types.NamespacedName{Name: np + nameRestService + "-config", Namespace: targetNamespace}, cm)).To(Succeed())
+			var config map[string]any
+			ExpectWithOffset(1, toml.Unmarshal([]byte(cm.Data["config.toml"]), &config)).To(Succeed())
+			section, ok := config["global-connection-types"].(map[string]any)
+			ExpectWithOffset(1, ok).To(BeTrue(), "expected [global-connection-types] section in REST config")
+			ids, ok := section["tenant-ids"].([]any)
+			ExpectWithOffset(1, ok).To(BeTrue(), "expected tenant-ids list in REST config")
+			return ids
+		}
+
+		BeforeEach(func() {
+			globalNamespaceConfig = GlobalNamespaceConfig{Enabled: true, LabelKey: labelKey}
+			ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: globalNS}}
+			Expect(client.IgnoreAlreadyExists(k8sClient.Create(ctx, ns))).To(Succeed())
+			setLabel(true)
+			createDatabaseSecret()
+			Expect(k8sClient.Create(ctx, &dchv1alpha1.DataConnectService{
+				ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: targetNamespace},
+			})).To(Succeed())
+		})
+
+		AfterEach(func() {
+			setLabel(false)
+			globalNamespaceConfig = GlobalNamespaceConfig{}
+			cleanupOperatorResources()
+			deleteCR()
+		})
+
+		It("should record the global namespaces without making them global connection type tenants", func() {
+			reconcileUntilReady()
+
+			cr := &dchv1alpha1.DataConnectService{}
+			Expect(k8sClient.Get(ctx, crKey, cr)).To(Succeed())
+			Expect(cr.Status.GlobalTenants).To(Equal([]string{globalNS}))
+			// Connection types in a global namespace stay scoped to it, so
+			// connections in other tenants never reference them.
+			Expect(restTenantIDs()).To(Equal([]any{targetNamespace}))
+
+			setLabel(false)
+			reconcileUntilReady()
+
+			Expect(k8sClient.Get(ctx, crKey, cr)).To(Succeed())
+			Expect(cr.Status.GlobalTenants).To(BeEmpty())
+			Expect(restTenantIDs()).To(Equal([]any{targetNamespace}))
 		})
 	})
 
@@ -622,6 +819,13 @@ var _ = Describe("DataConnectService Controller", func() {
 
 			cr := &dchv1alpha1.DataConnectService{}
 			Expect(k8sClient.Get(ctx, crKey, cr)).To(Succeed())
+			var idcts dchv1alpha1.InitDataConnectionTypeList
+			Expect(k8sClient.List(ctx, &idcts, client.InNamespace(targetNamespace))).To(Succeed())
+			Expect(idcts.Items).NotTo(BeEmpty())
+			// Simulate a seed created by a pre-owner-reference controller version.
+			legacyIDCT := idcts.Items[0].DeepCopy()
+			legacyIDCT.OwnerReferences = nil
+			Expect(k8sClient.Update(ctx, legacyIDCT)).To(Succeed())
 			Expect(k8sClient.Delete(ctx, cr)).To(Succeed())
 
 			_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: crKey})
@@ -633,6 +837,25 @@ var _ = Describe("DataConnectService Controller", func() {
 			Expect(errors.IsNotFound(err)).To(BeTrue())
 			err = k8sClient.Get(ctx, types.NamespacedName{Name: np + "kube-rbac-proxy-auth-review"}, &rbacv1.ClusterRoleBinding{})
 			Expect(errors.IsNotFound(err)).To(BeTrue())
+			Expect(k8sClient.List(ctx, &idcts, client.InNamespace(targetNamespace))).To(Succeed())
+			Expect(idcts.Items).To(BeEmpty())
+		})
+
+		It("should keep the finalizer when InitDataConnectionType deletion fails", func() {
+			r := reconciler()
+			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: crKey})
+			Expect(err).NotTo(HaveOccurred())
+
+			cr := &dchv1alpha1.DataConnectService{}
+			Expect(k8sClient.Get(ctx, crKey, cr)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, cr)).To(Succeed())
+
+			r.Client = denyInitDataConnectionTypeDeletes{Client: k8sClient}
+			_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: crKey})
+			Expect(err).To(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, crKey, cr)).To(Succeed())
+			Expect(controllerutil.ContainsFinalizer(cr, finalizerName)).To(BeTrue())
 		})
 	})
 
@@ -729,7 +952,7 @@ var _ = Describe("DataConnectService Controller", func() {
 					"distribution.name":    "Standalone",
 					"distribution.version": "0.0.0",
 					"gateway.name":         "custom-gateway",
-					"gateway.namespace":    "custom-ns",
+					"gateway.namespace":    rhoaiGatewayNS,
 				},
 			}
 			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
@@ -752,7 +975,17 @@ var _ = Describe("DataConnectService Controller", func() {
 			Expect(k8sClient.Get(ctx, crKey, cr)).To(Succeed())
 			Expect(cr.Status.Gateway).NotTo(BeNil())
 			Expect(cr.Status.Gateway.Name).To(Equal("custom-gateway"))
-			Expect(cr.Status.Gateway.Namespace).To(Equal("custom-ns"))
+			Expect(cr.Status.Gateway.Namespace).To(Equal(rhoaiGatewayNS))
+			expectGatewayPolicy("custom-gateway", rhoaiGatewayNS)
+
+			cm := &corev1.ConfigMap{}
+			key := types.NamespacedName{Name: platformConfigName, Namespace: targetNamespace}
+			Expect(k8sClient.Get(ctx, key, cm)).To(Succeed())
+			cm.Data["gateway.namespace"] = "updated-ns"
+			Expect(k8sClient.Update(ctx, cm)).To(Succeed())
+			_, err := reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: crKey})
+			Expect(err).NotTo(HaveOccurred())
+			expectGatewayPolicy("custom-gateway", "updated-ns")
 		})
 
 		It("should prefer spec.gateway over ConfigMap gateway", func() {
@@ -773,6 +1006,7 @@ var _ = Describe("DataConnectService Controller", func() {
 			Expect(cr.Status.Gateway).NotTo(BeNil())
 			Expect(cr.Status.Gateway.Name).To(Equal("spec-gateway"))
 			Expect(cr.Status.Gateway.Namespace).To(Equal("spec-ns"))
+			expectGatewayPolicy("spec-gateway", "spec-ns")
 		})
 	})
 })
@@ -780,6 +1014,7 @@ var _ = Describe("DataConnectService Controller", func() {
 const (
 	testOTLPEndpoint = "http://otel:4317"
 	testEnvRustLog   = "RUST_LOG"
+	testEnvRustWarn  = "warn"
 )
 
 var _ = Describe("traceEnv", func() {
@@ -961,6 +1196,189 @@ var _ = Describe("reconcileTraceEnv", func() {
 
 		Expect(reconcileTraceEnv([]*unstructured.Unstructured{deploy}, trace, nameRestService)).To(BeTrue())
 		Expect(envOf(deploy, nameRestService)).NotTo(BeEmpty())
+		Expect(envOf(deploy, nameKubeRbacProxy)).To(BeEmpty())
+	})
+})
+
+var _ = Describe("auditEnv", func() {
+	It("returns nil when audit is unset", func() {
+		Expect(auditEnv(nil)).To(BeNil())
+	})
+
+	It("returns nil when enabled is unset", func() {
+		Expect(auditEnv(&dchv1alpha1.Audit{})).To(BeNil())
+	})
+
+	It("returns nil when disabled", func() {
+		Expect(auditEnv(&dchv1alpha1.Audit{Enabled: ptr.To(false)})).To(BeNil())
+	})
+
+	It("returns AUDIT_ENABLED=true when enabled", func() {
+		Expect(auditEnv(&dchv1alpha1.Audit{Enabled: ptr.To(true)})).To(Equal([]corev1.EnvVar{
+			{Name: envAuditEnabled, Value: valueTrue},
+		}))
+	})
+
+	It("returns AUDIT_ENABLED and AUDIT_LOG_QUERIES when both enabled", func() {
+		Expect(auditEnv(&dchv1alpha1.Audit{Enabled: ptr.To(true), LogQueries: ptr.To(true)})).To(Equal([]corev1.EnvVar{
+			{Name: envAuditEnabled, Value: valueTrue},
+			{Name: envAuditLogQueries, Value: valueTrue},
+		}))
+	})
+
+	It("omits AUDIT_LOG_QUERIES when logQueries is unset", func() {
+		Expect(auditEnv(&dchv1alpha1.Audit{Enabled: ptr.To(true)})).To(Equal([]corev1.EnvVar{
+			{Name: envAuditEnabled, Value: valueTrue},
+		}))
+	})
+
+	It("omits AUDIT_LOG_QUERIES when logQueries is false", func() {
+		Expect(auditEnv(&dchv1alpha1.Audit{Enabled: ptr.To(true), LogQueries: ptr.To(false)})).To(Equal([]corev1.EnvVar{
+			{Name: envAuditEnabled, Value: valueTrue},
+		}))
+	})
+
+	It("returns nil when logQueries is enabled but audit is disabled", func() {
+		Expect(auditEnv(&dchv1alpha1.Audit{Enabled: ptr.To(false), LogQueries: ptr.To(true)})).To(BeNil())
+	})
+})
+
+var _ = Describe("reconcileAuditEnv", func() {
+	It("sets AUDIT_ENABLED=true on both service containers when enabled", func() {
+		deploy := newDeployment(
+			corev1.Container{Name: nameRestServiceContainer},
+			corev1.Container{Name: nameFlightServiceContainer},
+		)
+		audit := &dchv1alpha1.Audit{Enabled: ptr.To(true)}
+
+		Expect(reconcileAuditEnv([]*unstructured.Unstructured{deploy}, audit, nameRestServiceContainer, nameFlightServiceContainer)).To(BeTrue())
+		Expect(envOf(deploy, nameRestServiceContainer)).To(Equal([]corev1.EnvVar{{Name: envAuditEnabled, Value: valueTrue}}))
+		Expect(envOf(deploy, nameFlightServiceContainer)).To(Equal([]corev1.EnvVar{{Name: envAuditEnabled, Value: valueTrue}}))
+	})
+
+	It("sets AUDIT_LOG_QUERIES=true on both service containers when logQueries is enabled", func() {
+		deploy := newDeployment(
+			corev1.Container{Name: nameRestServiceContainer},
+			corev1.Container{Name: nameFlightServiceContainer},
+		)
+		audit := &dchv1alpha1.Audit{Enabled: ptr.To(true), LogQueries: ptr.To(true)}
+
+		Expect(reconcileAuditEnv([]*unstructured.Unstructured{deploy}, audit, nameRestServiceContainer, nameFlightServiceContainer)).To(BeTrue())
+		Expect(envOf(deploy, nameRestServiceContainer)).To(Equal([]corev1.EnvVar{
+			{Name: envAuditEnabled, Value: valueTrue},
+			{Name: envAuditLogQueries, Value: valueTrue},
+		}))
+		Expect(envOf(deploy, nameFlightServiceContainer)).To(Equal([]corev1.EnvVar{
+			{Name: envAuditEnabled, Value: valueTrue},
+			{Name: envAuditLogQueries, Value: valueTrue},
+		}))
+	})
+
+	It("leaves AUDIT_ENABLED unset when audit is nil", func() {
+		deploy := newDeployment(corev1.Container{Name: nameRestServiceContainer})
+
+		Expect(reconcileAuditEnv([]*unstructured.Unstructured{deploy}, nil, nameRestServiceContainer)).To(BeFalse())
+		Expect(envOf(deploy, nameRestServiceContainer)).To(BeEmpty())
+	})
+
+	It("leaves AUDIT_ENABLED unset when disabled", func() {
+		deploy := newDeployment(corev1.Container{Name: nameRestServiceContainer})
+		audit := &dchv1alpha1.Audit{Enabled: ptr.To(false)}
+
+		Expect(reconcileAuditEnv([]*unstructured.Unstructured{deploy}, audit, nameRestServiceContainer)).To(BeFalse())
+		Expect(envOf(deploy, nameRestServiceContainer)).To(BeEmpty())
+	})
+
+	It("removes a stale AUDIT_ENABLED=true when toggled back to disabled", func() {
+		existing := corev1.EnvVar{Name: testEnvRustLog, Value: testEnvRustWarn}
+		stale := corev1.EnvVar{Name: envAuditEnabled, Value: valueTrue}
+		deploy := newDeployment(corev1.Container{
+			Name: nameRestServiceContainer,
+			Env:  []corev1.EnvVar{existing, stale},
+		})
+		audit := &dchv1alpha1.Audit{Enabled: ptr.To(false)}
+
+		Expect(reconcileAuditEnv([]*unstructured.Unstructured{deploy}, audit, nameRestServiceContainer)).To(BeTrue())
+		Expect(envOf(deploy, nameRestServiceContainer)).To(Equal([]corev1.EnvVar{existing}))
+	})
+
+	It("removes a stale AUDIT_LOG_QUERIES=true when logQueries is toggled back to disabled", func() {
+		existing := corev1.EnvVar{Name: testEnvRustLog, Value: testEnvRustWarn}
+		staleQueries := corev1.EnvVar{Name: envAuditLogQueries, Value: valueTrue}
+		deploy := newDeployment(corev1.Container{
+			Name: nameRestServiceContainer,
+			Env:  []corev1.EnvVar{existing, staleQueries},
+		})
+		audit := &dchv1alpha1.Audit{Enabled: ptr.To(true), LogQueries: ptr.To(false)}
+
+		Expect(reconcileAuditEnv([]*unstructured.Unstructured{deploy}, audit, nameRestServiceContainer)).To(BeTrue())
+		Expect(envOf(deploy, nameRestServiceContainer)).To(Equal([]corev1.EnvVar{
+			existing,
+			{Name: envAuditEnabled, Value: valueTrue},
+		}))
+	})
+
+	It("removes stale audit env vars when audit is disabled", func() {
+		existing := corev1.EnvVar{Name: testEnvRustLog, Value: testEnvRustWarn}
+		stale := []corev1.EnvVar{
+			{Name: envAuditEnabled, Value: valueTrue},
+			{Name: envAuditLogQueries, Value: valueTrue},
+		}
+		deploy := newDeployment(corev1.Container{
+			Name: nameRestServiceContainer,
+			Env:  append([]corev1.EnvVar{existing}, stale...),
+		})
+		audit := &dchv1alpha1.Audit{Enabled: ptr.To(false), LogQueries: ptr.To(true)}
+
+		Expect(reconcileAuditEnv([]*unstructured.Unstructured{deploy}, audit, nameRestServiceContainer)).To(BeTrue())
+		Expect(envOf(deploy, nameRestServiceContainer)).To(Equal([]corev1.EnvVar{existing}))
+	})
+
+	It("updates an existing AUDIT_LOG_QUERIES rather than duplicating it", func() {
+		deploy := newDeployment(corev1.Container{Name: nameRestServiceContainer})
+		enabled := &dchv1alpha1.Audit{Enabled: ptr.To(true), LogQueries: ptr.To(true)}
+		Expect(reconcileAuditEnv([]*unstructured.Unstructured{deploy}, enabled, nameRestServiceContainer)).To(BeTrue())
+		Expect(envOf(deploy, nameRestServiceContainer)).To(HaveLen(2))
+
+		queriesOff := &dchv1alpha1.Audit{Enabled: ptr.To(true), LogQueries: ptr.To(false)}
+		Expect(reconcileAuditEnv([]*unstructured.Unstructured{deploy}, queriesOff, nameRestServiceContainer)).To(BeTrue())
+		Expect(envOf(deploy, nameRestServiceContainer)).To(Equal([]corev1.EnvVar{{Name: envAuditEnabled, Value: valueTrue}}))
+	})
+
+	It("updates an existing AUDIT_ENABLED rather than duplicating it", func() {
+		deploy := newDeployment(corev1.Container{Name: nameRestServiceContainer})
+		enabled := &dchv1alpha1.Audit{Enabled: ptr.To(true)}
+		Expect(reconcileAuditEnv([]*unstructured.Unstructured{deploy}, enabled, nameRestServiceContainer)).To(BeTrue())
+
+		disabled := &dchv1alpha1.Audit{Enabled: ptr.To(false)}
+		Expect(reconcileAuditEnv([]*unstructured.Unstructured{deploy}, disabled, nameRestServiceContainer)).To(BeTrue())
+		Expect(envOf(deploy, nameRestServiceContainer)).To(BeEmpty())
+	})
+
+	It("preserves non-audit env vars", func() {
+		existing := []corev1.EnvVar{
+			{Name: testEnvRustLog, Value: "debug"},
+			{Name: envOTLPEndpoint, Value: testOTLPEndpoint},
+		}
+		deploy := newDeployment(corev1.Container{Name: nameRestServiceContainer, Env: existing})
+		audit := &dchv1alpha1.Audit{Enabled: ptr.To(true)}
+
+		Expect(reconcileAuditEnv([]*unstructured.Unstructured{deploy}, audit, nameRestServiceContainer)).To(BeTrue())
+		env := envOf(deploy, nameRestServiceContainer)
+		Expect(env).To(ContainElements(existing))
+		Expect(env).To(ContainElement(corev1.EnvVar{Name: envAuditEnabled, Value: valueTrue}))
+		Expect(env).To(HaveLen(3))
+	})
+
+	It("only touches named containers", func() {
+		deploy := newDeployment(
+			corev1.Container{Name: nameRestServiceContainer},
+			corev1.Container{Name: nameKubeRbacProxy},
+		)
+		audit := &dchv1alpha1.Audit{Enabled: ptr.To(true)}
+
+		Expect(reconcileAuditEnv([]*unstructured.Unstructured{deploy}, audit, nameRestServiceContainer)).To(BeTrue())
+		Expect(envOf(deploy, nameRestServiceContainer)).NotTo(BeEmpty())
 		Expect(envOf(deploy, nameKubeRbacProxy)).To(BeEmpty())
 	})
 })

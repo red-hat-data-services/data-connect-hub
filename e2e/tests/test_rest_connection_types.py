@@ -6,7 +6,8 @@ import time
 import uuid
 
 import pytest
-from data_connect_hub import DataConnectClient, DCHNotFoundError
+
+from data_connect_hub import CredentialField, DataConnectClient, DCHNotFoundError
 
 EXPECTED_OOB_CONNECTION_TYPES = {
     "Postgres": "postgres",
@@ -15,7 +16,21 @@ EXPECTED_OOB_CONNECTION_TYPES = {
     "HuggingFace": "huggingface",
     "Milvus": "milvus",
     "Neo4j": "neo4j",
+    "OCI": "oci",
+    "S3": "s3",
     "URI": "uri",
+}
+
+EXPECTED_SUPPORTED_FORMATS = {
+    "Postgres": ["tabular"],
+    "PGVector": ["tabular"],
+    "ElasticSearch": ["tabular"],
+    "HuggingFace": [],
+    "Milvus": ["tabular"],
+    "Neo4j": ["tabular"],
+    "OCI": [],
+    "S3": ["tabular", "binary"],
+    "URI": ["tabular", "binary"],
 }
 
 EXPECTED_CREDENTIAL_FIELDS = {
@@ -23,42 +38,81 @@ EXPECTED_CREDENTIAL_FIELDS = {
     "HuggingFace": {"URI", "TOKEN"},
     "Milvus": {"URI", "TOKEN", "DATABASE", "CA_CERT"},
     "Neo4j": {"URI", "USERNAME", "PASSWORD", "DATABASE", "CA_CERT"},
+    "OCI": {"ACCESS_TYPE", ".dockerconfigjson", "OCI_HOST"},
+    "S3": {
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_S3_BUCKET",
+        "AWS_S3_ENDPOINT",
+        "AWS_DEFAULT_REGION",
+        "AWS_S3_CA_CERT",
+    },
 }
+
+# Credential fields that must be marked sensitive in every OOB type that has them.
+# URI is included because connection URIs may embed passwords; .dockerconfigjson
+# embeds registry credentials.
+SENSITIVE_CREDENTIAL_FIELDS = {"URI", "PASSWORD", "TOKEN", "API_KEY", "AWS_SECRET_ACCESS_KEY", ".dockerconfigjson"}
 
 
 class TestRestConnectionType:
-    def test_oob_connection_types_are_registered(self, rest_client: DataConnectClient) -> None:
-        """Verify the controller registers every built-in connection type."""
+    def test_oob_connection_types(self, rest_client: DataConnectClient) -> None:
+        """Verify all OOB connection types are registered with correct attributes."""
         deadline = time.monotonic() + 30
         listed_types = []
         while time.monotonic() < deadline:
             listed_types = rest_client.list_connection_types()
-            if all(
-                sum(connection_type.name == name for connection_type in listed_types) == 1
-                for name in EXPECTED_OOB_CONNECTION_TYPES
-            ):
+            if all(sum(ct.name == name for ct in listed_types) == 1 for name in EXPECTED_OOB_CONNECTION_TYPES):
                 break
             time.sleep(1)
 
-        for name, provider in EXPECTED_OOB_CONNECTION_TYPES.items():
-            matching_types = [connection_type for connection_type in listed_types if connection_type.name == name]
-            assert len(matching_types) == 1, f"expected exactly one OOB connection type named {name!r}"
-            assert matching_types[0].provider == provider
+        by_name = {ct.name: ct for ct in listed_types}
 
-        by_name = {connection_type.name: connection_type for connection_type in listed_types}
+        # 1. every expected type exists with the correct provider
+        for name, provider in EXPECTED_OOB_CONNECTION_TYPES.items():
+            ct = by_name.get(name)
+            assert ct is not None, f"expected OOB connection type {name!r} not found"
+            assert ct.provider == provider
+
+        # 2. credential field schemas
         for name, expected_fields in EXPECTED_CREDENTIAL_FIELDS.items():
             actual_fields = {field.name for field in by_name[name].credentials_fields}
             assert actual_fields == expected_fields
 
-        postgres_schema = {(field.name, field.required, field.type) for field in by_name["Postgres"].credentials_fields}
-        pgvector_schema = {(field.name, field.required, field.type) for field in by_name["PGVector"].credentials_fields}
+        access_type = next(f for f in by_name["OCI"].credentials_fields if f.name == "ACCESS_TYPE")
+        assert access_type.type == "enum"
+        assert access_type.multiple is True
+        assert [(e.value, e.label) for e in access_type.enum_values or []] == [
+            ("Push", "Push secret"),
+            ("Pull", "Pull secret"),
+        ]
+
+        postgres_schema = {(f.name, f.required, f.type) for f in by_name["Postgres"].credentials_fields}
+        pgvector_schema = {(f.name, f.required, f.type) for f in by_name["PGVector"].credentials_fields}
         assert pgvector_schema == postgres_schema
+
+        # 2b. sensitive flags on credential fields
+        for name in EXPECTED_OOB_CONNECTION_TYPES:
+            for field in by_name[name].credentials_fields:
+                expected = field.name in SENSITIVE_CREDENTIAL_FIELDS
+                assert field.sensitive is expected, f"{name}.{field.name}: sensitive={field.sensitive}, want {expected}"
+
+        # 3. supported_formats set correctly after flight registration
+        for name, expected_formats in EXPECTED_SUPPORTED_FORMATS.items():
+            ct = by_name[name]
+            assert sorted(ct.status.supported_formats) == sorted(expected_formats), (
+                f"{name}: expected supported_formats={expected_formats}, got {ct.status.supported_formats}"
+            )
 
     def test_crud(self, rest_client: DataConnectClient, create_connection_type) -> None:
         ct = create_connection_type(
             name="e2e-postgres-type",
             provider="postgres",
             description="e2e crud test type",
+            credentials_fields=[
+                CredentialField(name="URI", label="URI", required=True, type="string", sensitive=True),
+                CredentialField(name="CA_CERT", label="CA Certificate", required=False, type="string"),
+            ],
         )
 
         types = rest_client.list_connection_types()
@@ -68,6 +122,8 @@ class TestRestConnectionType:
         assert fetched.name == "e2e-postgres-type"
         assert fetched.provider == "postgres"
         assert fetched.description == "e2e crud test type"
+        sensitive = {f.name: f.sensitive for f in fetched.credentials_fields}
+        assert sensitive == {"URI": True, "CA_CERT": False}
 
     def test_delete(self, rest_client: DataConnectClient, create_connection_type) -> None:
         ct = create_connection_type(provider="postgres")
@@ -90,3 +146,19 @@ class TestRestConnectionType:
         ct = create_connection_type(provider="postgres")
         updated = rest_client.update_connection_type(ct.id, description="updated description")
         assert updated.description == "updated description"
+
+    def test_update_sensitive(self, rest_client: DataConnectClient, create_connection_type) -> None:
+        ct = create_connection_type(
+            provider="postgres",
+            credentials_fields=[CredentialField(name="TOKEN", label="Token", required=False, type="string")],
+        )
+        assert ct.credentials_fields[0].sensitive is False
+
+        rest_client.update_connection_type(
+            ct.id,
+            credentials_fields=[
+                CredentialField(name="TOKEN", label="Token", required=False, type="string", sensitive=True)
+            ],
+        )
+        fetched = rest_client.get_connection_type(ct.id)
+        assert fetched.credentials_fields[0].sensitive is True

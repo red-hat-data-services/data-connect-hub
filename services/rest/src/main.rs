@@ -11,7 +11,8 @@ use crate::state::ApiService;
 use crate::utils::ServerConfig;
 use anyhow::Result;
 use commons::api::storage::MetaStore;
-use commons::utils::{TraceConfig, init_tracing, log_trace_exporter};
+use commons::utils::audit::AuditConfig;
+use commons::utils::{TraceConfig, init_tracing_json, log_trace_exporter};
 use config::{Config, File};
 use kube_utils::secrets::KubeSecretStore;
 use pg_meta_store::store::PgMetaStore;
@@ -21,7 +22,9 @@ use url::Url;
 /// SERVICE_NAME identifies this service in exported traces.
 const SERVICE_NAME: &str = "dch-rest-service";
 
+mod auth;
 mod clients;
+mod fips;
 mod rest;
 #[allow(unused)]
 mod state;
@@ -180,19 +183,157 @@ async fn read_ca_cert(config: &ServerConfig) -> Result<Option<Vec<u8>>, anyhow::
     }
 }
 
+/// Installs the OpenSSL-backed rustls provider as the process default, so
+/// that TLS cryptography is performed by the system OpenSSL — and therefore,
+/// on a FIPS-mode host, by the validated FIPS provider — rather than by a
+/// statically linked Rust implementation.
+///
+/// Key exchange groups are restricted to the NIST curves first. `rustls`
+/// computes `CryptoProvider::fips()` as an `all()` across every configured
+/// component, and derives `ClientConfig::require_ems` from that value, so a
+/// single component reporting non-FIPS would silently disable Extended Master
+/// Secret — mandatory for the TLS 1.2 KDF under FIPS 140-3 IG section D.Q.
+///
+/// When `DCH_REQUIRE_FIPS` is set, a configuration that does not report FIPS
+/// is treated as fatal rather than degrading quietly.
+///
+/// The status is returned rather than logged: this has to run before
+/// `init_tracing_json`, which may open an OTLP exporter over TLS, so no
+/// subscriber exists yet and anything logged here would be discarded.
+struct CryptoStatus {
+    context_fips: bool,
+    provider_fips: bool,
+    cipher_suites_fips: bool,
+    kx_groups_fips: bool,
+    signature_verification_fips: bool,
+    secure_random_fips: bool,
+    key_provider_fips: bool,
+    config_fips: bool,
+    kx_groups: Vec<rustls::NamedGroup>,
+    cipher_suites: Vec<rustls::CipherSuite>,
+    signature_schemes: Vec<rustls::SignatureScheme>,
+}
+
+impl CryptoStatus {
+    fn log(&self) {
+        tracing::info!(
+            context_fips = self.context_fips,
+            provider_fips = self.provider_fips,
+            cipher_suites_fips = self.cipher_suites_fips,
+            kx_groups_fips = self.kx_groups_fips,
+            signature_verification_fips = self.signature_verification_fips,
+            secure_random_fips = self.secure_random_fips,
+            key_provider_fips = self.key_provider_fips,
+            config_fips = self.config_fips,
+            kx_groups = ?self.kx_groups,
+            cipher_suites = ?self.cipher_suites,
+            signature_schemes = ?self.signature_schemes,
+            "installed OpenSSL-backed rustls crypto provider"
+        );
+    }
+}
+
+fn install_crypto_provider() -> Result<CryptoStatus> {
+    use rustls::crypto::CryptoProvider;
+
+    fips::load_default_openssl_config()?;
+
+    // try_default_provider, not default_provider: the component lists are
+    // discovered by probing the OpenSSL context, and an empty one is reported
+    // here rather than surfacing later as a handshake the peer rejects.
+    let mut provider = rustls_ossl::try_default_provider()
+        .map_err(|e| anyhow::anyhow!("the OpenSSL crypto provider is unusable: {e}"))?;
+
+    fips::retain_fips_kx_groups(&mut provider);
+    let kx_groups: Vec<_> = provider.kx_groups.iter().map(|g| g.name()).collect();
+    // try_default_provider above vouches for what the OpenSSL context
+    // supplied; this guards what the policy applied here leaves behind. Every
+    // FIPS flag below is an `all()`, which is true over an empty list, so a
+    // provider filtered down to nothing would report flawless compliance
+    // while being unable to complete a handshake — an empty
+    // signature_algorithms extension does not even encode to a valid
+    // ClientHello.
+    let cipher_suites: Vec<_> = provider.cipher_suites.iter().map(|suite| suite.suite()).collect();
+    let signature_schemes: Vec<_> = provider
+        .signature_verification_algorithms
+        .mapping
+        .iter()
+        .map(|(scheme, _)| *scheme)
+        .collect();
+
+    if cipher_suites.is_empty() || kx_groups.is_empty() || signature_schemes.is_empty() {
+        return Err(anyhow::anyhow!(
+            "the configured FIPS policy left an incomplete algorithm set \
+             (cipher suites: {}, kx groups: {}, signature algorithms: {}); refusing to start",
+            cipher_suites.len(),
+            kx_groups.len(),
+            signature_schemes.len(),
+        ));
+    }
+
+    let cipher_suites_fips = provider.cipher_suites.iter().all(|suite| suite.fips());
+    let kx_groups_fips = provider.kx_groups.iter().all(|group| group.fips());
+    let signature_verification_fips = provider.signature_verification_algorithms.fips();
+    let secure_random_fips = provider.secure_random.fips();
+    let key_provider_fips = provider.key_provider.fips();
+    let provider_fips = provider.fips();
+    let context_fips = rustls_ossl::osslctx().fips_is_enabled();
+
+    CryptoProvider::install_default(provider)
+        .map_err(|_| anyhow::anyhow!("a rustls CryptoProvider was already installed"))?;
+
+    // Build a throwaway client configuration purely to read the config-level
+    // FIPS status: it folds in `require_ems`, which the provider-level flag
+    // does not cover. tonic builds its own configurations internally, so
+    // there is no live one to inspect here.
+    let probe = rustls::ClientConfig::builder()
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
+    let config_fips = probe.fips();
+
+    if std::env::var_os("DCH_REQUIRE_FIPS").is_some() && !config_fips {
+        return Err(anyhow::anyhow!(
+            "DCH_REQUIRE_FIPS is set but the TLS configuration does not report FIPS \
+             (provider_fips={provider_fips}, config_fips={config_fips}); refusing to start"
+        ));
+    }
+
+    Ok(CryptoStatus {
+        context_fips,
+        provider_fips,
+        cipher_suites_fips,
+        kx_groups_fips,
+        signature_verification_fips,
+        secure_random_fips,
+        key_provider_fips,
+        config_fips,
+        kx_groups,
+        cipher_suites,
+        signature_schemes,
+    })
+}
+
 #[actix_web::main]
 async fn main() -> Result<()> {
-    rustls::crypto::aws_lc_rs::default_provider()
-        .install_default()
-        .expect("Failed to install rustls CryptoProvider");
+    let crypto_status = install_crypto_provider()?;
 
     let args = CommandLineArgs::parse();
     let config = Arc::new(load_config(args.config.clone(), args.secret_config.clone())?);
 
     let trace = TraceConfig::from_env();
-    let tracer_provider = init_tracing(SERVICE_NAME, args.json_logs, &trace)?;
+    let audit = AuditConfig::from_env();
+    let tracer_provider = init_tracing_json(SERVICE_NAME, args.json_logs, &trace)?;
+
+    crypto_status.log();
 
     tracing::info!("Starting DataConnectorHub API service");
+    tracing::info!(
+        audit_enabled = audit.enabled,
+        audit_log_queries = audit.log_queries,
+        "Audit logging is {}, query logging is {}",
+        if audit.enabled { "enabled" } else { "disabled" },
+        if audit.log_queries { "enabled" } else { "disabled" }
+    );
     log_config_source(&args.config, "--config", true);
     log_config_source(&args.secret_config, "--secret-config", false);
     log_trace_exporter(&trace);
@@ -200,7 +341,7 @@ async fn main() -> Result<()> {
     let pg_meta_store = Arc::new(
         PgMetaStore::new(
             config.database.clone(),
-            config.global_connection_types.tenant_id.clone(),
+            config.global_connection_types.tenant_ids.clone(),
         )
         .await?,
     );
@@ -210,13 +351,27 @@ async fn main() -> Result<()> {
 
     let flight_ca_cert = read_ca_cert(&config).await?;
 
-    let service = Arc::new(ApiService::new(
+    let mut service = ApiService::new(
         meta_store,
         Arc::new(secret_store),
         flight_ca_cert,
         config.server.sa_token_file.clone(),
-        config.global_connection_types.tenant_id.clone(),
-    ));
+    );
+    if config.auth.enabled {
+        tracing::info!("Auth enabled (cache TTL: {}s)", config.auth.cache_ttl_secs);
+        let auth_client = kube_utils::auth::KubeAuthClient::try_default(
+            std::time::Duration::from_secs(config.auth.cache_ttl_secs),
+            // kube-rbac-proxy strips the Authorization header, so the
+            // rest-service never reviews request tokens and configures no
+            // TokenReview audiences.
+            Vec::new(),
+        )
+        .await?;
+        service = service.with_authorizer(std::sync::Arc::new(auth_client));
+    } else {
+        tracing::warn!("Auth is DISABLED — secret references are not checked against the requester");
+    }
+    let service = Arc::new(service);
 
     let metrics_enabled = config.metrics.enabled;
     if metrics_enabled {
@@ -246,6 +401,7 @@ async fn main() -> Result<()> {
                 middleware::from_fn(observe_http_request),
             ))
             .app_data(web::Data::from(service.clone()))
+            .app_data(web::Data::new(audit))
             .app_data(json_config())
             .app_data(query_config())
             .app_data(path_config())

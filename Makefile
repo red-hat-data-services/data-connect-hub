@@ -8,6 +8,7 @@ $(error VERSION could not be determined; set VERSION explicitly)
 endif
 IMAGE            ?= data-connection-hub
 CONTAINER_ENGINE ?= $(shell command -v podman 2>/dev/null || command -v docker 2>/dev/null)
+REDOCLY_CLI      ?= docker.io/redocly/cli:2.69.0
 V                ?=
 
 ifneq ($(V),)
@@ -16,13 +17,14 @@ endif
 
 .PHONY: all build release check clean \
 	test test-unit test-integration \
-	lint fmt doc audit check-dco \
+	lint fmt doc audit check-dco check-leaks check-sast \
 	require-container-engine \
 	container-flight container-rest container-all \
 	container-run-flight container-run-rest \
 	oc-setup-flight oc-setup-rest oc-setup-all \
 	oc-build-flight oc-build-rest oc-build-all \
-	sdk-install sdk-test sdk-lint sdk-fmt sdk-typecheck sdk-build sdk-package-check sdk-all \
+	sdk-install sdk-test sdk-test-min sdk-lint sdk-fmt sdk-typecheck sdk-build sdk-package-check sdk-all \
+	e2e-venv e2e-lint e2e-fmt build-samples lint-samples \
 	setup-hooks help
 
 # -------------------------------------------------------------------
@@ -135,9 +137,75 @@ doc:
 
 audit:
 	cargo audit
+	cargo deny check
 
 check-dco:
 	@bash hack/check-dco.sh
+
+# Pinned gitleaks for check-leaks, downloaded on demand into the gitignored
+# .local/bin. Keep the version in sync with
+# .github/workflows/ci-secret-scanning.yml.
+GITLEAKS_VERSION ?= 8.28.0
+GITLEAKS_DIR     := .local/bin
+GITLEAKS_OS      := $(shell uname -s | tr '[:upper:]' '[:lower:]')
+GITLEAKS_ARCH    := $(shell uname -m | sed -e 's/^x86_64$$/x64/' -e 's/^aarch64$$/arm64/')
+GITLEAKS_ASSET   := gitleaks_$(GITLEAKS_VERSION)_$(GITLEAKS_OS)_$(GITLEAKS_ARCH).tar.gz
+GITLEAKS_LOCAL   := $(GITLEAKS_DIR)/gitleaks-$(GITLEAKS_VERSION)
+
+$(GITLEAKS_DIR):
+	mkdir -p $@
+
+# Downloaded from the official release and verified against its checksums
+# file so check-leaks always runs the exact version CI uses.
+$(GITLEAKS_LOCAL): | $(GITLEAKS_DIR)
+	tmp=$$(mktemp -d) && \
+	curl -sSLfo "$$tmp/$(GITLEAKS_ASSET)" \
+		"https://github.com/gitleaks/gitleaks/releases/download/v$(GITLEAKS_VERSION)/$(GITLEAKS_ASSET)" && \
+	curl -sSLfo "$$tmp/checksums.txt" \
+		"https://github.com/gitleaks/gitleaks/releases/download/v$(GITLEAKS_VERSION)/gitleaks_$(GITLEAKS_VERSION)_checksums.txt" && \
+	grep -F "$(GITLEAKS_ASSET)" "$$tmp/checksums.txt" | (cd "$$tmp" && { sha256sum --check - || shasum -a 256 --check -; }) && \
+	tar -xzf "$$tmp/$(GITLEAKS_ASSET)" -C "$(GITLEAKS_DIR)" gitleaks && \
+	mv "$(GITLEAKS_DIR)/gitleaks" "$@" && \
+	rm -rf "$$tmp"
+
+check-leaks: $(GITLEAKS_LOCAL)
+	"$(GITLEAKS_LOCAL)" git --verbose --redact --no-banner .
+
+# Pinned semgrep for check-sast, installed on demand into the gitignored
+# .local/semgrep-venv. Keep the version in sync with
+# .github/workflows/ci-semgrep.yml.
+SEMGREP_VERSION ?= 1.187.0
+SEMGREP_VENV    := .local/semgrep-venv
+# Findings already on the baseline commit do not fail the scan; only new
+# ones do. Set SEMGREP_BASELINE= (empty) to report every finding.
+SEMGREP_BASELINE ?= origin/main
+
+ifeq ($(strip $(SEMGREP_BASELINE)),)
+  SEMGREP_BASELINE_ARGS :=
+else
+  SEMGREP_BASELINE_ARGS := --baseline-commit "$(SEMGREP_BASELINE)"
+endif
+
+$(SEMGREP_VENV)/bin/python3:
+	python3 -m venv $(SEMGREP_VENV)
+
+check-sast: | $(SEMGREP_VENV)/bin/python3
+	$(SEMGREP_VENV)/bin/pip install --quiet "semgrep==$(SEMGREP_VERSION)"
+	$(SEMGREP_VENV)/bin/semgrep scan --config semgrep.yaml $(SEMGREP_BASELINE_ARGS) \
+		--severity ERROR --severity WARNING --error --metrics=off .
+
+# -------------------------------------------------------------------
+# Samples
+# -------------------------------------------------------------------
+
+SAMPLES_DIR := samples/custom-connector
+
+build-samples:
+	cargo build --manifest-path $(SAMPLES_DIR)/Cargo.toml
+
+lint-samples:
+	cargo clippy --manifest-path $(SAMPLES_DIR)/Cargo.toml --all-targets -- -D warnings
+	cargo fmt --manifest-path $(SAMPLES_DIR)/Cargo.toml -- --check
 
 # -------------------------------------------------------------------
 # Python SDK
@@ -161,10 +229,26 @@ $(PYTHON_SDK_DIR)/.venv/bin/python3:
 sdk-venv: $(SDK_VENV_PREREQ)
 
 sdk-install: sdk-venv
+	$(SDK_PYTHON) -m pip install --upgrade -r "$(PYTHON_SDK_DIR)/requirements.txt"
 	$(SDK_PYTHON) -m pip install -e "$(PYTHON_SDK_DIR)[flight,dev]"
 
 sdk-test: sdk-venv
 	cd $(PYTHON_SDK_DIR) && $(SDK_BIN)pytest tests/ -v --cov=data_connect_hub --cov-report=term-missing --cov-report=html:htmlcov
+
+# Separate venv so the pinned minimum versions never downgrade the dev venv.
+# Uses the oldest supported Python: the pinned pyarrow/pandas have no wheels for
+# newer ones. Override on the command line, e.g.
+# make sdk-test-min SDK_MIN_PYTHON="$(uv python find 3.11)"
+SDK_MIN_VENV   := $(PYTHON_SDK_DIR)/.venv-min
+SDK_MIN_PYTHON ?= python3.11
+
+$(SDK_MIN_VENV)/bin/python3:
+	"$(SDK_MIN_PYTHON)" -m venv "$(SDK_MIN_VENV)"
+
+sdk-test-min: $(SDK_MIN_VENV)/bin/python3
+	$(SDK_MIN_VENV)/bin/python3 -m pip install --upgrade -r "$(PYTHON_SDK_DIR)/requirements.txt"
+	$(SDK_MIN_VENV)/bin/python3 -m pip install -e "$(PYTHON_SDK_DIR)[flight,dev]" -c "$(PYTHON_SDK_DIR)/constraints-min.txt"
+	cd $(PYTHON_SDK_DIR) && "$(abspath $(SDK_MIN_VENV))/bin/pytest" tests/ -v
 
 sdk-lint: sdk-venv
 	cd $(PYTHON_SDK_DIR) && $(SDK_BIN)ruff check src/ tests/ examples/*.py
@@ -185,6 +269,37 @@ sdk-package-check: sdk-build
 	"$(SDK_PYTHON)" -m twine check "$(PYTHON_SDK_DIR)"/dist/*
 
 sdk-all: sdk-lint sdk-typecheck sdk-test sdk-package-check
+
+# -------------------------------------------------------------------
+# E2E
+# -------------------------------------------------------------------
+
+E2E_DIR := e2e
+
+ifdef VIRTUAL_ENV
+  E2E_PYTHON      := python3
+  E2E_BIN         :=
+  E2E_VENV_PREREQ :=
+else
+  E2E_PYTHON      := $(E2E_DIR)/.venv/bin/python3
+  E2E_BIN         := .venv/bin/
+  E2E_VENV_PREREQ := $(E2E_PYTHON)
+endif
+
+$(E2E_DIR)/.venv/bin/python3:
+	python3 -m venv $(E2E_DIR)/.venv
+
+e2e-venv: $(E2E_VENV_PREREQ)
+
+e2e-lint: e2e-venv
+	$(E2E_PYTHON) -m pip install --quiet "ruff>=0.5"
+	cd $(E2E_DIR) && $(E2E_BIN)ruff check tests/ scenarios/ conftest.py
+	cd $(E2E_DIR) && $(E2E_BIN)ruff format --check tests/ scenarios/ conftest.py
+
+e2e-fmt: e2e-venv
+	$(E2E_PYTHON) -m pip install --quiet "ruff>=0.5"
+	cd $(E2E_DIR) && $(E2E_BIN)ruff format tests/ scenarios/ conftest.py
+	cd $(E2E_DIR) && $(E2E_BIN)ruff check --fix tests/ scenarios/ conftest.py
 
 # -------------------------------------------------------------------
 # OpenAPI docs
@@ -222,7 +337,7 @@ _generate-openapi-docs-container:
 		--pull=newer \
 		-v "$$PWD:/spec:Z" \
 		--entrypoint sh \
-		docker.io/redocly/cli -c ' \
+		$(REDOCLY_CLI) -c ' \
 			echo "1. Bundling external spec to openapi.yaml (with x-internal removed)..." && redocly bundle external@latest --output docs/api/openapi.yaml --remove-unused-components && \
 			echo "2. Bundling external spec to openapi.json (with x-internal removed)..." && redocly bundle external@latest --ext json --output docs/api/openapi.json && \
 			echo "3. Bundling internal spec to openapi-internal.yaml (with x-internal removed)..." && redocly bundle internal@latest --output docs/api/openapi-internal.yaml --remove-unused-components && \
@@ -251,6 +366,7 @@ setup-hooks:
 help:
 	@echo "Variables:"
 	@echo "  V=1                  show test output (--nocapture)"
+	@echo "  SEMGREP_BASELINE     base commit for check-sast (default origin/main; empty = scan all)"
 	@echo ""
 	@echo "Top-level:"
 	@echo "  all                  build + fmt + lint + test + audit"
@@ -270,7 +386,10 @@ help:
 	@echo "  lint                 clippy + rustfmt check"
 	@echo "  fmt                  format all crates"
 	@echo "  doc                  rustdoc with warnings"
-	@echo "  audit                cargo audit"
+	@echo "  audit                cargo audit + cargo deny check"
+	@echo "  check-dco            verify Signed-off-by trailers"
+	@echo "  check-leaks          scan git history for leaked secrets (pinned gitleaks, auto-downloaded)"
+	@echo "  check-sast           semgrep static analysis (new findings vs origin/main)"
 	@echo ""
 	@echo "Container:"
 	@echo "  container-flight     build flight-service image"
@@ -287,12 +406,21 @@ help:
 	@echo "  oc-build-rest        start rest-service build on cluster"
 	@echo "  oc-build-all         build all services on cluster"
 	@echo ""
+	@echo "Samples:"
+	@echo "  build-samples       build the custom-connector sample"
+	@echo "  lint-samples        clippy + rustfmt check the custom-connector sample"
+	@echo ""
 	@echo "Python SDK:"
 	@echo "  sdk-install          install SDK in editable mode with dev deps"
 	@echo "  sdk-test             run SDK unit tests with coverage"
+	@echo "  sdk-test-min         run SDK unit tests on minimum dependency versions"
 	@echo "  sdk-lint             lint and format-check SDK"
 	@echo "  sdk-fmt              format SDK code"
 	@echo "  sdk-typecheck        run mypy on SDK"
 	@echo "  sdk-build            build SDK wheel and source distribution"
 	@echo "  sdk-package-check    build and validate SDK distribution metadata"
 	@echo "  sdk-all              lint + typecheck + test + package check SDK"
+	@echo ""
+	@echo "E2E:"
+	@echo "  e2e-lint             lint and format-check E2E tests"
+	@echo "  e2e-fmt              format and auto-fix E2E tests"

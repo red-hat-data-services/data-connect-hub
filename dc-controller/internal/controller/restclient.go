@@ -82,10 +82,12 @@ type FlightServiceStatus struct {
 
 // ConnectionType mirrors the Rust DataConnectionType JSON structure.
 type ConnectionType struct {
-	Name              string  `json:"name"`
-	Provider          string  `json:"provider"`
-	Description       *string `json:"description,omitempty"`
-	CredentialsFields []Field `json:"credentials_fields"`
+	Name              string   `json:"name"`
+	Label             *string  `json:"label,omitempty"`
+	Provider          string   `json:"provider"`
+	Description       *string  `json:"description,omitempty"`
+	CredentialsFields []Field  `json:"credentials_fields"`
+	Tags              []string `json:"tags,omitempty"`
 }
 
 // Field mirrors the Rust Field JSON structure.
@@ -97,6 +99,8 @@ type Field struct {
 	Type         string      `json:"type"`
 	EnumValues   []EnumValue `json:"enum_values,omitempty"`
 	DefaultValue *string     `json:"default_value,omitempty"`
+	Sensitive    bool        `json:"sensitive"`
+	Multiple     bool        `json:"multiple"`
 }
 
 // EnumValue mirrors the Rust EnumValue JSON structure.
@@ -108,6 +112,7 @@ type EnumValue struct {
 // Connection mirrors the Rust DataConnection JSON structure.
 type Connection struct {
 	Name                 string            `json:"name"`
+	Description          *string           `json:"description,omitempty"`
 	DataConnectionTypeID string            `json:"data_connection_type_id"`
 	Format               string            `json:"format"`
 	CredentialsRef       *CredentialsRef   `json:"credentials_ref"`
@@ -151,30 +156,38 @@ type httpConnectionTypeClient struct {
 	httpClient *http.Client
 }
 
-func newHTTPClient(resolver URLResolver) *httpConnectionTypeClient {
-	return newHTTPClientWithServiceCAPath(resolver, serviceCABundlePath)
+type TLSOption = func(*tls.Config)
+
+func newTLSConfig(roots *x509.CertPool, tlsOptions []TLSOption) *tls.Config {
+	config := &tls.Config{RootCAs: roots}
+	for _, option := range tlsOptions {
+		option(config)
+	}
+	return config
 }
 
-func newHTTPClientWithRootCAs(resolver URLResolver, roots *x509.CertPool) *httpConnectionTypeClient {
+func newHTTPClient(resolver URLResolver, tlsOptions ...TLSOption) *httpConnectionTypeClient {
+	return newHTTPClientWithServiceCAPath(resolver, serviceCABundlePath, tlsOptions...)
+}
+
+func newHTTPClientWithRootCAs(resolver URLResolver, roots *x509.CertPool, tlsOptions ...TLSOption) *httpConnectionTypeClient {
 	return &httpConnectionTypeClient{
 		resolveURL: resolver,
 		tokenPath:  saTokenPath,
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{
-					RootCAs: roots,
-				},
+				TLSClientConfig:   newTLSConfig(roots, tlsOptions),
 				ForceAttemptHTTP2: true,
 			},
 		},
 	}
 }
 
-func newHTTPClientWithServiceCAPath(resolver URLResolver, caPath string) *httpConnectionTypeClient {
+func newHTTPClientWithServiceCAPath(resolver URLResolver, caPath string, tlsOptions ...TLSOption) *httpConnectionTypeClient {
 	transport := &reloadableServiceCATransport{
 		base: &http.Transport{
-			TLSClientConfig:   &tls.Config{},
+			TLSClientConfig:   newTLSConfig(nil, tlsOptions),
 			ForceAttemptHTTP2: true,
 		},
 		caPath: caPath,
@@ -233,20 +246,20 @@ func rootCAs(serviceCA []byte) *x509.CertPool {
 // NewHTTPConnectionTypeClient creates a ConnectionTypeClient that calls the
 // rest-service through kube-rbac-proxy over HTTPS. The URL is resolved
 // dynamically via the provided resolver.
-func NewHTTPConnectionTypeClient(resolver URLResolver) ConnectionTypeClient {
-	return newHTTPClient(resolver)
+func NewHTTPConnectionTypeClient(resolver URLResolver, tlsOptions ...TLSOption) ConnectionTypeClient {
+	return newHTTPClient(resolver, tlsOptions...)
 }
 
 // NewHTTPMigrationClient creates a ConnectionMigrationClient for the
 // Secret watcher to list connection types and create connections.
-func NewHTTPMigrationClient(resolver URLResolver) ConnectionMigrationClient {
-	return newHTTPClient(resolver)
+func NewHTTPMigrationClient(resolver URLResolver, tlsOptions ...TLSOption) ConnectionMigrationClient {
+	return newHTTPClient(resolver, tlsOptions...)
 }
 
 // NewHTTPFlightServiceClient creates a FlightServiceClient that registers
 // flight services through the REST service.
-func NewHTTPFlightServiceClient(resolver URLResolver) FlightServiceClient {
-	return newHTTPClient(resolver)
+func NewHTTPFlightServiceClient(resolver URLResolver, tlsOptions ...TLSOption) FlightServiceClient {
+	return newHTTPClient(resolver, tlsOptions...)
 }
 
 func (c *httpConnectionTypeClient) baseURL() (string, error) {

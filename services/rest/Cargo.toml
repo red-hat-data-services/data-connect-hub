@@ -2,6 +2,8 @@
 name = "rest-service"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
+publish = false
 
 [lints]
 workspace = true
@@ -21,8 +23,12 @@ futures = { workspace = true }
 prost = { workspace = true }
 commons = { workspace = true }
 pg-meta-store = { workspace = true }
-tonic = { workspace = true, features = ["tls-aws-lc"] }
+tonic = { workspace = true, features = ["tls-native-roots"] }
 rustls = { workspace = true }
+rustls-ossl = { workspace = true }
+# Used to load the FIPS provider for rustls-ossl's library context. The "log"
+# feature also surfaces the OpenSSL error stack behind a failed call.
+ossl = { workspace = true }
 config = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
@@ -31,6 +37,7 @@ kube-utils = { workspace = true }
 tokio = { workspace = true }
 url = { workspace = true }
 chrono = { workspace = true }
+uuid = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 opentelemetry-otlp = { workspace = true }

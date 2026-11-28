@@ -6,6 +6,7 @@ working with code in this repository.
 ## Requirements
 
 - Rust stable 1.96+
+- `cargo-audit` and `cargo-deny` (supply chain checks, used by `make audit`)
 - Go 1.23+ (for dc-controller)
 - Python 3.11+ (for SDK)
 - PostgreSQL (for integration testing)
@@ -19,8 +20,12 @@ make test           # all tests
 make fmt            # format all crates
 make lint           # clippy + fmt check
 make doc            # rustdoc with -D warnings
-make audit          # cargo audit
+make audit          # cargo audit + cargo deny check
+make check-leaks    # scan git history for leaked secrets (gitleaks)
+make check-sast     # semgrep SAST (new findings vs origin/main)
 make container-all  # build all container images
+make build-samples  # build the custom-connector sample
+make lint-samples   # clippy + fmt check the custom-connector sample
 ```
 
 Run a single test:
@@ -37,6 +42,7 @@ Python SDK:
 
 ```console
 make sdk-test       # run SDK unit tests with coverage
+make sdk-test-min   # run SDK unit tests on minimum dependency versions
 make sdk-lint       # lint and format-check SDK
 make sdk-fmt        # format SDK code
 make sdk-typecheck  # run mypy on SDK
@@ -162,8 +168,16 @@ Workflows under `.github/workflows/`:
 
 - **`build-and-test.yml`** — runs on every PR and push
   to `main`. Build, clippy, rustfmt check, unit tests,
-  rustdoc warnings, and `cargo audit`. Uses
+  and rustdoc warnings. Uses
   `Swatinem/rust-cache` for dependency caching.
+- **`supply-chain.yaml`** — runs on every PR and push to
+  `main`.
+  Two jobs: `security-audit` (`cargo audit`) and
+  `dependency-check` (`cargo deny check` for advisories,
+  licenses, bans, and sources). Ignored
+  advisories that go stale fail via
+  `unused-ignored-advisory = "deny"` in `deny.toml`.
+- **`api-contract.yml`** — runs on PRs to `main`. API contract checks from `red-hat-data-services/api-contract-tests` (enforce mode): breaking changes to `docs/api/openapi.yaml`, `dc-controller/charts/crds/*.yaml` or `dc-controller/config/crd/bases/*.yaml` relative to the baseline SHA fail the job, and the coverage job fails on any OpenAPI document or CRD not registered or excluded in `.rhoai/contracts.yaml`. Changing the baseline needs approval from someone other than the author.
 - **`python-sdk.yml`** — runs on PRs touching `sdk/python/`.
   Lint, typecheck, and unit tests for the Python SDK.
 - **`ci-dco-signoff.yml`** — runs on PRs. Verifies all
@@ -173,6 +187,24 @@ Workflows under `.github/workflows/`:
   all commits have a valid GPG/SSH signature.
 - **`ci-check-typos.yml`** — runs on PRs. Checks for
   common typos using `crate-ci/typos`.
+- **`ci-secret-scanning.yml`** — runs on every PR and push
+  to `main`. Scans the full git history for leaked secrets
+  (API keys, tokens, passwords) with a pinned `gitleaks`,
+  using the centrally synced `.gitleaks.toml` rules. Known
+  false positives are baselined in `.gitleaksignore`; the
+  workflow fails on any new finding. Run locally with
+  `make check-leaks`.
+- **`ci-semgrep.yml`** — runs on PRs to `main`. Static
+  analysis with the centrally synced `semgrep.yaml` rules
+  (Go, Python, YAML, generic secret patterns). Findings
+  already on the PR base are baselined via
+  `--baseline-commit`, so only findings introduced by the
+  PR fail the job; the ~70 pre-existing findings on `main`
+  (mostly test fixtures and manifest hardening items) are
+  triaged separately. Suppress false positives inline with
+  `# nosemgrep: <rule-id>` comments. Run locally with
+  `make check-sast` (new findings vs `origin/main`, so commit
+  your work first; `SEMGREP_BASELINE=` scans everything).
 - **`ci-stale-reviews.yml`** — dismisses stale PR
   reviews after new pushes.
 
@@ -187,7 +219,16 @@ make check-dco   # run DCO check locally
   all use Helm). We should plan to convert our `dc-controller/config/` overlays to a Helm chart in a future release.
   Reference PRs: opendatahub-operator#3813 (OGX/Helm), #3654 (MLflow/Kustomize migration).
 - The DataConnectService CRD uses API group `dataconnecthub.opendatahub.io`.
-- The CR is cluster-scoped and singleton (`default-dataconnectservice`).
+- The DataConnectService application CR is namespaced. The platform-managed instance
+  is `default-dataconnectservice` in `odh-dch-infra` (ODH) or
+  `redhat-dch-infra` (RHOAI), with a DSC namespace override. The
+  controller and Gateway HTTPRoute remain in the applications namespace.
+- DSC onboarding uses `spec.components.data.dataConnectHub` and the existing
+  Feast module operator / `Platform.spec.modules.data` boundary. Do not add an
+  independent DCH module handler, Platform module entry, or DataConnectHub module
+  CR. The Feast module installs dc-controller and manages its application CR;
+  the platform aggregates module status into DSC. See
+  `docs/dev-guide/dsc-data-onboarding-plan.md` for the implementation plan.
 - Status follows the PlatformObject contract: `observedGeneration`, `distribution`, `releases`,
   and conditions `Ready`, `ProvisioningSucceeded`, `Degraded`.
 - Application images are resolved from env vars for disconnected/air-gapped support:

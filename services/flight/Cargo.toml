@@ -2,6 +2,8 @@
 name = "flight-service"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
+publish = false
 
 [lints]
 workspace = true
@@ -56,7 +58,11 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 kube-utils = { workspace = true }
 tower = { workspace = true }
-rustls = { workspace = true }
+# flight-service still installs the aws-lc-rs provider explicitly. Re-enabled
+# here rather than workspace-wide so rest-service's graph stays clean; removed
+# when flight migrates to rustls-ossl.
+rustls = { workspace = true, features = ["aws_lc_rs"] }
+tokio-rustls = { workspace = true, features = ["aws_lc_rs"] }
 http = { workspace = true }
 http-body = { workspace = true }
 http-body-util = { workspace = true }
@@ -70,3 +76,5 @@ sqlx = { workspace = true }
 opendal = { workspace = true }
 parquet = { workspace = true }
 arrow-csv = { workspace = true }
+rcgen = { workspace = true }
+tempfile = { workspace = true }

@@ -55,6 +55,7 @@ class DataConnection(_MaskProperties, BaseModel):
 
     id: str
     name: str
+    description: str | None = None
     data_connection_type_id: str
     format: DataFormat
     tenant_id: str = ""
@@ -79,6 +80,7 @@ class CreateConnectionRequest(_MaskProperties, BaseModel):
     model_config = ConfigDict(hide_input_in_errors=True)
 
     name: str
+    description: str | None = None
     data_connection_type_id: str
     format: DataFormat
     credentials_ref: CredentialsRef | None = None
@@ -94,6 +96,7 @@ class CreateConnectionRequest(_MaskProperties, BaseModel):
 
 class UpdateConnectionRequest(_MaskProperties, BaseModel):
     name: str | None = None
+    description: str | None = None
     data_connection_type_id: str | None = None
     format: DataFormat | None = None
     credentials_ref: CredentialsRef | None = None
@@ -122,9 +125,12 @@ class CredentialField(BaseModel):
     type: str
     enum_values: list[EnumValue] | None = None
     default_value: str | None = None
+    sensitive: bool = False
+    multiple: bool = False
 
 
 class ConnectionTypeStatus(BaseModel):
+    supported_formats: list[str] = Field(default_factory=list)
     flight_ready: bool = False
     flight_url: str | None = None
     message: str | None = None
@@ -134,12 +140,14 @@ class ConnectionTypeStatus(BaseModel):
 class ConnectionType(BaseModel):
     id: str
     name: str
+    label: str | None = None
     provider: str
     description: str | None = None
     tenant_id: str = ""
     created_at: datetime | None = None
     updated_at: datetime | None = None
     credentials_fields: list[CredentialField] = Field(default_factory=list)
+    tags: list[str] | None = None
     status: ConnectionTypeStatus = Field(default_factory=ConnectionTypeStatus)
 
     @model_validator(mode="before")
@@ -155,13 +163,17 @@ class ConnectionType(BaseModel):
 
 class CreateConnectionTypeRequest(BaseModel):
     name: str
+    label: str | None = None
     provider: str
     description: str | None = None
     credentials_fields: list[CredentialField] = Field(default_factory=list)
+    tags: list[str] | None = None
 
 
 class UpdateConnectionTypeRequest(BaseModel):
     name: str | None = None
+    label: str | None = None
     provider: str | None = None
     description: str | None = None
     credentials_fields: list[CredentialField] | None = None
+    tags: list[str] | None = None

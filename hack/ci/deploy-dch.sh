@@ -3,6 +3,8 @@
 set -euo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/lib.sh"
 
+CI_E2E_RUNTIME_BASE_IMAGE=registry.access.redhat.com/ubi9/ubi-minimal
+
 # ===================================================================
 # Build images
 # ===================================================================
@@ -10,10 +12,14 @@ source "$(cd "$(dirname "$0")" && pwd)/lib.sh"
 echo "=== Building images ==="
 
 echo "--- Building flight-service ---"
-docker build -t "$CI_FLIGHT_IMAGE" -f "$CI_REPO_ROOT/services/flight/Containerfile.konflux" "$CI_REPO_ROOT"
+docker build \
+    --build-arg "RUNTIME_BASE_IMAGE=${CI_E2E_RUNTIME_BASE_IMAGE}" \
+    -t "$CI_FLIGHT_IMAGE" -f "$CI_REPO_ROOT/services/flight/Containerfile.konflux" "$CI_REPO_ROOT"
 
 echo "--- Building rest-service ---"
-docker build -t "$CI_REST_IMAGE" -f "$CI_REPO_ROOT/services/rest/Containerfile.konflux" "$CI_REPO_ROOT"
+docker build \
+    --build-arg "RUNTIME_BASE_IMAGE=${CI_E2E_RUNTIME_BASE_IMAGE}" \
+    -t "$CI_REST_IMAGE" -f "$CI_REPO_ROOT/services/rest/Containerfile.konflux" "$CI_REPO_ROOT"
 
 echo "--- Building dc-controller ---"
 sed -E -i.bak 's/^([[:space:]]*imagePullPolicy:).*/\1 IfNotPresent/' \
@@ -22,7 +28,9 @@ rm -f "$CI_REPO_ROOT/config/base/flight-service/deployment.yaml.bak"
 sed -E -i.bak 's/^([[:space:]]*imagePullPolicy:).*/\1 IfNotPresent/' \
     "$CI_REPO_ROOT/config/base/rest-service/deployment.yaml"
 rm -f "$CI_REPO_ROOT/config/base/rest-service/deployment.yaml.bak"
-docker build -t "$CI_CONTROLLER_IMAGE" -f "$CI_REPO_ROOT/dc-controller/Containerfile.konflux" "$CI_REPO_ROOT"
+docker build \
+    --build-arg "RUNTIME_BASE_IMAGE=${CI_E2E_RUNTIME_BASE_IMAGE}" \
+    -t "$CI_CONTROLLER_IMAGE" -f "$CI_REPO_ROOT/dc-controller/Containerfile.konflux" "$CI_REPO_ROOT"
 
 # ===================================================================
 # Load images into kind
@@ -32,6 +40,17 @@ echo "=== Loading images into kind ==="
 kind load docker-image "$CI_FLIGHT_IMAGE" --name "$CI_KIND_CLUSTER_NAME"
 kind load docker-image "$CI_REST_IMAGE" --name "$CI_KIND_CLUSTER_NAME"
 kind load docker-image "$CI_CONTROLLER_IMAGE" --name "$CI_KIND_CLUSTER_NAME"
+
+echo "=== Pulling tracing images inside kind node ==="
+# kind load docker-image fails for multi-arch registry images: it pipes
+# `docker save` into `ctr images import --all-platforms`, which requires
+# content for every platform in the index, but the host only pulled the
+# local platform. Pulling inside the node lets its containerd resolve
+# the index for the node platform itself.
+docker exec "${CI_KIND_CLUSTER_NAME}-control-plane" \
+    ctr --namespace=k8s.io images pull "$CI_OTEL_COLLECTOR_IMAGE"
+docker exec "${CI_KIND_CLUSTER_NAME}-control-plane" \
+    ctr --namespace=k8s.io images pull "$CI_JAEGER_IMAGE"
 
 assert_deployment_image() {
     local deployment="$1"
@@ -64,12 +83,12 @@ assert_deployment_image() {
 
 echo "=== Deploying system PostgreSQL ==="
 
-sys_pg_url="postgresql://${CI_SYS_PG_USER}:${CI_SYS_PG_PASSWORD}@${CI_SYS_PG_HOST}:5432/${CI_SYS_PG_DATABASE}"
+sys_pg_url="postgresql://${CI_SYS_PG_USER}@${CI_SYS_PG_HOST}:5432/${CI_SYS_PG_DATABASE}"
 
 sys_pg_args=(-n "$CI_SVC_NAMESPACE" -r "$CI_SYS_PG_HOST" -u "$CI_SYS_PG_USER" -p "$CI_SYS_PG_PASSWORD" -d "$CI_SYS_PG_DATABASE" -t "180s")
 if [[ "$CI_SSL_ENABLED" == "true" ]]; then
-    sys_pg_args+=(--ssl)
-    sys_pg_url="${sys_pg_url}?sslmode=verify-ca"
+    sys_pg_args+=(--ssl --client-cert-auth)
+    sys_pg_url="${sys_pg_url}?sslmode=verify-full&sslrootcert=/secrets/postgresql-ca.crt&sslcert=/secrets/postgresql-client.crt&sslkey=/secrets/postgresql-client.key"
 fi
 bash "$CI_REPO_ROOT/hack/install-postgresql.sh" "${sys_pg_args[@]}"
 
@@ -78,7 +97,15 @@ sys_pg_secret_args=()
 if [[ "$CI_SSL_ENABLED" == "true" ]]; then
     kubectl get secret "${CI_SYS_PG_HOST}-tls" -n "$CI_SVC_NAMESPACE" \
         -o jsonpath='{.data.ca\.crt}' | base64 -d > "${CI_TEMP_DIR}/postgresql-ca.crt"
-    sys_pg_secret_args+=(--from-file=postgresql-ca.crt="${CI_TEMP_DIR}/postgresql-ca.crt")
+    kubectl get secret "${CI_SYS_PG_HOST}-client-tls" -n "$CI_SVC_NAMESPACE" \
+        -o jsonpath='{.data.client\.crt}' | base64 -d > "${CI_TEMP_DIR}/postgresql-client.crt"
+    kubectl get secret "${CI_SYS_PG_HOST}-client-tls" -n "$CI_SVC_NAMESPACE" \
+        -o jsonpath='{.data.client\.key}' | base64 -d > "${CI_TEMP_DIR}/postgresql-client.key"
+    sys_pg_secret_args+=(
+        --from-file=postgresql-ca.crt="${CI_TEMP_DIR}/postgresql-ca.crt"
+        --from-file=postgresql-client.crt="${CI_TEMP_DIR}/postgresql-client.crt"
+        --from-file=postgresql-client.key="${CI_TEMP_DIR}/postgresql-client.key"
+    )
 fi
 
 dch_secret_config_file="${CI_TEMP_DIR}/dch-secret-config.toml"
@@ -129,6 +156,143 @@ kubectl create configmap dch-flight-service-ca -n "$CI_SVC_NAMESPACE" \
 rm -f "${CI_TEMP_DIR}"/*-tls.key "${CI_TEMP_DIR}"/*-tls.crt
 
 # ===================================================================
+# Tracing: OTEL Collector + Jaeger
+# ===================================================================
+
+echo "=== Deploying Jaeger ==="
+kubectl apply -n "$CI_SVC_NAMESPACE" -f - <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jaeger
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: jaeger
+  template:
+    metadata:
+      labels:
+        app: jaeger
+    spec:
+      containers:
+      - name: jaeger
+        image: ${CI_JAEGER_IMAGE}
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 4317
+        - containerPort: 16686
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jaeger
+spec:
+  selector:
+    app: jaeger
+  ports:
+  - name: otlp-grpc
+    port: 4317
+    targetPort: 4317
+  - name: query
+    port: 16686
+    targetPort: 16686
+EOF
+
+echo "=== Deploying OTEL Collector ==="
+kubectl apply -n "$CI_SVC_NAMESPACE" -f - <<'OTELCFG'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector-config
+data:
+  config.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+    exporters:
+      otlp:
+        endpoint: jaeger:4317
+        tls:
+          insecure: true
+    service:
+      pipelines:
+        traces:
+          receivers: [otlp]
+          exporters: [otlp]
+OTELCFG
+
+kubectl apply -n "$CI_SVC_NAMESPACE" -f - <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: otel-collector
+  template:
+    metadata:
+      labels:
+        app: otel-collector
+    spec:
+      containers:
+      - name: otel-collector
+        image: ${CI_OTEL_COLLECTOR_IMAGE}
+        imagePullPolicy: IfNotPresent
+        args: ["--config=/etc/otel/config.yaml"]
+        ports:
+        - containerPort: 4317
+        volumeMounts:
+        - name: config
+          mountPath: /etc/otel
+      volumes:
+      - name: config
+        configMap:
+          name: otel-collector-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector
+spec:
+  selector:
+    app: otel-collector
+  ports:
+  - name: otlp-grpc
+    port: 4317
+    targetPort: 4317
+EOF
+
+kubectl rollout status deployment/jaeger -n "$CI_SVC_NAMESPACE" --timeout=120s
+kubectl rollout status deployment/otel-collector -n "$CI_SVC_NAMESPACE" --timeout=120s
+
+# ===================================================================
+# Platform Auth CRD and CR
+# ===================================================================
+
+# On RHOAI the opendatahub-operator installs the Auth CRD and creates the
+# "auth" CR before DCH. dc-controller enables global namespaces only when the
+# CRD exists at startup, so both must be in place before it is installed.
+# adminGroups names a group no e2e identity belongs to; the e2e user manages
+# the global namespace through its own RoleBinding (see e2e/run-e2e.sh).
+echo "=== Installing platform Auth CRD and CR ==="
+kubectl apply -f "$CI_REPO_ROOT/dc-controller/internal/controller/testdata/crd/services.platform.opendatahub.io_auths.yaml"
+kubectl wait --for=condition=Established crd/auths.services.platform.opendatahub.io --timeout=60s
+kubectl apply -f - <<EOF
+apiVersion: services.platform.opendatahub.io/v1alpha1
+kind: Auth
+metadata:
+  name: auth
+spec:
+  adminGroups: ["dch-e2e-global-admins"]
+  allowedGroups: ["system:authenticated"]
+EOF
+
+# ===================================================================
 # dc-controller (Helm)
 # ===================================================================
 
@@ -172,6 +336,9 @@ spec:
   gateway:
     name: ${CI_GATEWAY_NAME}
     namespace: ${CI_GATEWAY_NAMESPACE}
+  trace:
+    exporter: "http://otel-collector.${CI_SVC_NAMESPACE}.svc:4317"
+    insecure: true
   restService:
     env:
       - name: RUST_LOG
@@ -257,6 +424,137 @@ spec:
     nodePort: ${CI_REST_METRICS_NODE_PORT}
 EOF
 
+# ===================================================================
+# Jaeger query NodePort (mapped to localhost via kind extraPortMappings)
+# ===================================================================
+
+echo "=== Creating Jaeger query NodePort service ==="
+kubectl apply -n "$CI_SVC_NAMESPACE" -f - <<EOF
+apiVersion: v1
+kind: Service
+metadata:
+  name: jaeger-query-nodeport
+spec:
+  type: NodePort
+  selector:
+    app: jaeger
+  ports:
+  - port: 16686
+    targetPort: 16686
+    nodePort: ${CI_JAEGER_NODE_PORT}
+EOF
+
+# ===================================================================
+# Legacy connection import fixtures (ODH Dashboard ConfigMaps + Secrets)
+# ===================================================================
+
+echo "=== Creating legacy connection import fixtures ==="
+kubectl create namespace "$CI_TENANT_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+
+# s3 connection type (mirrors odh-dashboard/manifests/base/connection-types/s3.yaml;
+# should be skipped — covered by built-in S3 type)
+kubectl apply -n "$CI_TENANT_NAMESPACE" -f - <<'EOF'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: s3
+  labels:
+    opendatahub.io/connection-type: "true"
+  annotations:
+    openshift.io/display-name: "S3 compatible object storage - v1"
+    openshift.io/description: "Connect to storage systems that are compatible with Amazon S3"
+data:
+  category: '["Object storage"]'
+  fields: |
+    [
+      {"type":"short-text","name":"Access key","envVar":"AWS_ACCESS_KEY_ID","required":true,"properties":{}},
+      {"type":"hidden","name":"Secret key","envVar":"AWS_SECRET_ACCESS_KEY","required":true,"properties":{}},
+      {"type":"short-text","name":"Endpoint","envVar":"AWS_S3_ENDPOINT","required":true,"properties":{}},
+      {"type":"short-text","name":"Region","envVar":"AWS_DEFAULT_REGION","required":false,"properties":{}},
+      {"type":"short-text","name":"Bucket","envVar":"AWS_S3_BUCKET","required":false,"properties":{}}
+    ]
+EOF
+
+# oci-v1 connection type (mirrors odh-dashboard/manifests/base/connection-types/oci-v1.yaml;
+# should be skipped — covered by built-in OCI type)
+kubectl apply -n "$CI_TENANT_NAMESPACE" -f - <<'EOF'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: oci-v1
+  labels:
+    opendatahub.io/connection-type: "true"
+  annotations:
+    openshift.io/display-name: "OCI compliant registry - v1"
+    openshift.io/description: "Connect to an OCI-compliant container registry"
+data:
+  category: '["Container registry"]'
+  fields: |
+    [
+      {"type":"dropdown","name":"Access type","description":"Use the push access type for uploading data, pull for accessing resources, or both.","envVar":"ACCESS_TYPE","properties":{"variant":"multi","items":[{"label":"Push secret","value":"Push"},{"label":"Pull secret","value":"Pull"}]}},
+      {"type":"file","name":"Secret details","envVar":".dockerconfigjson","properties":{"deferInput":true,"extensions":[".dockerconfigjson",".json"],"helperText":"Secret details are visible to users with access to the project."}},
+      {"type":"short-text","name":"Registry host","envVar":"OCI_HOST","properties":{}}
+    ]
+EOF
+
+# uri-v1 connection type (should be skipped — covered by built-in URI type)
+kubectl apply -n "$CI_TENANT_NAMESPACE" -f - <<'EOF'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: uri-v1
+  labels:
+    opendatahub.io/connection-type: "true"
+  annotations:
+    openshift.io/display-name: "URI - v1"
+    openshift.io/description: "URI connection type"
+data:
+  category: '["URI"]'
+  fields: |
+    [{"type":"uri","name":"URI","envVar":"URI","required":true,"properties":{}}]
+EOF
+
+# Legacy S3 connection Secret (should resolve to built-in S3 via alias)
+kubectl create secret generic e2e-legacy-s3-conn \
+    -n "$CI_TENANT_NAMESPACE" \
+    --from-literal=AWS_ACCESS_KEY_ID=e2e-test-key \
+    --from-literal=AWS_SECRET_ACCESS_KEY=e2e-test-secret \
+    --from-literal=AWS_S3_ENDPOINT=http://example.com:9000 \
+    --from-literal=AWS_DEFAULT_REGION=us-east-1 \
+    --from-literal=AWS_S3_BUCKET=e2e-test-bucket \
+    --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+kubectl label secret e2e-legacy-s3-conn -n "$CI_TENANT_NAMESPACE" \
+    opendatahub.io/dashboard=true --overwrite >/dev/null
+kubectl annotate secret e2e-legacy-s3-conn -n "$CI_TENANT_NAMESPACE" \
+    openshift.io/display-name="E2E Legacy S3 Connection" \
+    openshift.io/description="E2E legacy S3 description" \
+    opendatahub.io/connection-type-ref=s3 \
+    --overwrite >/dev/null
+
+# Legacy OCI connection Secret (should resolve to built-in OCI via alias)
+kubectl create secret generic e2e-legacy-oci-conn \
+    -n "$CI_TENANT_NAMESPACE" \
+    --from-literal=ACCESS_TYPE='["Pull"]' \
+    --from-literal=OCI_HOST=registry.example.com \
+    --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+kubectl label secret e2e-legacy-oci-conn -n "$CI_TENANT_NAMESPACE" \
+    opendatahub.io/dashboard=true --overwrite >/dev/null
+kubectl annotate secret e2e-legacy-oci-conn -n "$CI_TENANT_NAMESPACE" \
+    openshift.io/display-name="E2E Legacy OCI Connection" \
+    opendatahub.io/connection-type-ref=oci-v1 \
+    --overwrite >/dev/null
+
+# Legacy URI connection Secret (should resolve to built-in URI via alias)
+kubectl create secret generic e2e-legacy-uri-conn \
+    -n "$CI_TENANT_NAMESPACE" \
+    --from-literal=URI=https://example.com/api \
+    --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+kubectl label secret e2e-legacy-uri-conn -n "$CI_TENANT_NAMESPACE" \
+    opendatahub.io/dashboard=true --overwrite >/dev/null
+kubectl annotate secret e2e-legacy-uri-conn -n "$CI_TENANT_NAMESPACE" \
+    openshift.io/display-name="E2E Legacy URI Connection" \
+    opendatahub.io/connection-type-ref=uri-v1 \
+    --overwrite >/dev/null
 
 # ===================================================================
 # Tenant data sources for E2E connectors
@@ -264,7 +562,8 @@ EOF
 
 if has_connector postgres; then
     echo "=== Deploying tenant PostgreSQL ==="
-    tenant_pg_args=(-n "$CI_TENANT_NAMESPACE" -r "$CI_TENANT_PG_HOST" -u "$CI_TENANT_PG_USER" -p "$CI_TENANT_PG_PASSWORD" -d "$CI_TENANT_PG_DATABASE" -t "180s")
+    # --pgvector: e2e/tests/test_flight_pgvector.py needs the extension.
+    tenant_pg_args=(-n "$CI_TENANT_NAMESPACE" -r "$CI_TENANT_PG_HOST" -u "$CI_TENANT_PG_USER" -p "$CI_TENANT_PG_PASSWORD" -d "$CI_TENANT_PG_DATABASE" -t "180s" --pgvector)
     if [[ "$CI_SSL_ENABLED" == "true" ]]; then
         tenant_pg_args+=(--ssl)
     fi

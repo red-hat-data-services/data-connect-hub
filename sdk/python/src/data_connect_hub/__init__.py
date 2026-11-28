@@ -2,6 +2,7 @@
 
 from importlib.metadata import PackageNotFoundError, version
 
+from ._fips import FipsStatus, fips_status
 from .client import DataConnectClient
 from .exceptions import (
     DCHAuthenticationError,
@@ -9,6 +10,7 @@ from .exceptions import (
     DCHConflictError,
     DCHConnectionError,
     DCHError,
+    DCHFipsWarning,
     DCHForbiddenError,
     DCHHTTPError,
     DCHNoDataError,
@@ -57,6 +59,7 @@ __all__ = [
     "DCHConflictError",
     "DCHConnectionError",
     "DCHError",
+    "DCHFipsWarning",
     "DCHForbiddenError",
     "DCHHTTPError",
     "DCHNoDataError",
@@ -72,8 +75,10 @@ __all__ = [
     "DataConnectionStatus",
     "DataFormat",
     "EnumValue",
+    "FipsStatus",
     "InlineCredentials",
     "UpdateConnectionRequest",
     "UpdateConnectionTypeRequest",
     "__version__",
+    "fips_status",
 ]

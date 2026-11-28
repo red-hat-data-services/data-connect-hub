@@ -29,6 +29,13 @@ type Gateway struct {
 
 	// namespace is the namespace of the Gateway resource
 	Namespace string `json:"namespace"`
+
+	// routeNamespace contains the HTTPRoute. Defaults to the DataConnectService
+	// namespace. When different, ReferenceGrants authorize the DCH backends.
+	// +kubebuilder:validation:Pattern="^([a-z0-9]([-a-z0-9]*[a-z0-9])?)?$"
+	// +kubebuilder:validation:MaxLength=63
+	// +optional
+	RouteNamespace string `json:"routeNamespace,omitempty"`
 }
 
 // ServiceOverrides allows per-service customisation of scaling and pod spec fields.
@@ -42,6 +49,11 @@ type ServiceOverrides struct {
 	// resources overrides the container resource requirements
 	// +optional
 	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
+
+	// imagePullPolicy overrides the container's image pull policy
+	// +kubebuilder:validation:Enum=Always;IfNotPresent;Never
+	// +optional
+	ImagePullPolicy *corev1.PullPolicy `json:"imagePullPolicy,omitempty"`
 
 	// env is a list of additional environment variables to set on the container
 	// +optional
@@ -151,6 +163,25 @@ type Trace struct {
 	Certificate string `json:"certificate,omitempty"`
 }
 
+// Audit configures audit logging for the REST and Flight services.
+type Audit struct {
+	// enabled turns on audit logging (who accessed what, and whether it
+	// succeeded or failed) in the REST and Flight service logs.
+	// Sets AUDIT_ENABLED on the rest-server and flight-server containers.
+	// +kubebuilder:default=false
+	// +optional
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// logQueries includes what was actually read (the SQL statement for
+	// query operations, or the file path for downloads) in the audit.query
+	// field of audit records. Queries can contain sensitive data, so this
+	// is off by default and only takes effect when enabled is true.
+	// Sets AUDIT_LOG_QUERIES on the rest-server and flight-server containers.
+	// +kubebuilder:default=false
+	// +optional
+	LogQueries *bool `json:"logQueries,omitempty"`
+}
+
 // DataConnectServiceSpec defines the desired state of DataConnectService
 type DataConnectServiceSpec struct {
 	// restService configures the REST API deployment
@@ -181,6 +212,11 @@ type DataConnectServiceSpec struct {
 	// When omitted, tracing is disabled.
 	// +optional
 	Trace *Trace `json:"trace,omitempty"`
+
+	// audit configures audit logging for the services.
+	// Audit logging is disabled by default.
+	// +optional
+	Audit *Audit `json:"audit,omitempty"`
 }
 
 // Addresses identifies an address where the service is reachable
@@ -224,6 +260,14 @@ type DataConnectServiceStatus struct {
 	// +optional
 	Gateway *Gateway `json:"gateway,omitempty"`
 
+	// globalTenants lists the namespaces labeled
+	// opendatahub.io/global-data-connect-hub-project, where the platform Auth CR
+	// groups are granted access to DCH resources. Empty when no namespace is
+	// labeled or the platform Auth API is not installed.
+	// +listType=set
+	// +optional
+	GlobalTenants []string `json:"globalTenants,omitempty"`
+
 	// conditions represent the current state of the DataConnectService resource.
 	// +listType=map
 	// +listMapKey=type
@@ -235,6 +279,7 @@ type DataConnectServiceStatus struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Namespaced,categories=opendatahub,shortName=dchs
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
+// +kubebuilder:printcolumn:name="Global Tenants",type=string,JSONPath=`.status.globalTenants`,priority=1
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 // DataConnectService is the Schema for the dataconnectservices API
 type DataConnectService struct {

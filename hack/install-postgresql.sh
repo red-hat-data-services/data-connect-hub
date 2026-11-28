@@ -3,6 +3,10 @@
 # Install PostgreSQL using a simple Kubernetes Deployment + Service.
 # Optionally enables SSL/TLS.
 #
+# With --pgvector, the pgvector extension is created in the target database
+# and the default image becomes pgvector/pgvector (the official postgres image
+# plus the extension). A custom -i image must then ship pgvector itself.
+#
 # When SSL is enabled, PostgreSQL is configured to REQUIRE TLS for
 # all TCP connections. Plain-text TCP connections are rejected.
 #
@@ -41,13 +45,18 @@ USERNAME="testuser"
 PASSWORD=""
 DATABASE="testdb"
 
-IMAGE="docker.io/library/postgres:16"
+IMAGE=""
+DEFAULT_IMAGE="docker.io/library/postgres:16"
+PGVECTOR_IMAGE="docker.io/pgvector/pgvector:pg16"
 TIMEOUT="300s"
+
+PGVECTOR_ENABLED=false
 
 SSL_ENABLED=false
 SSL_CERT=""
 SSL_KEY=""
 SSL_CA=""
+CLIENT_CERT_AUTH=false
 
 # ---------------------------------------------------------------------------
 # Usage
@@ -64,12 +73,15 @@ Options:
   -u USERNAME         database user               (default: testuser)
   -p PASSWORD         user password               (required)
   -d DATABASE         database name               (default: testdb)
-  -i IMAGE            postgres image              (default: docker.io/library/postgres:16)
+  -i IMAGE            postgres image              (default: ${DEFAULT_IMAGE},
+                                                   or ${PGVECTOR_IMAGE} with --pgvector)
   -t TIMEOUT          rollout timeout             (default: 300s)
+  --pgvector          create the pgvector extension in the database
   --ssl               enable SSL/TLS and require TLS
   --ssl-cert FILE     server certificate (PEM)
   --ssl-key FILE      server private key (PEM)
   --ssl-ca FILE       CA certificate (PEM)
+  --client-cert-auth  require client certificates for TCP connections
   -h, --help          show this help
 
 SSL:
@@ -84,6 +96,10 @@ SSL:
 
   --ssl-ca
       Optional CA certificate for client-side server certificate verification.
+
+  --client-cert-auth
+      Require client-certificate authentication for TCP connections. This is
+      only supported when the script generates the CA and server certificate.
 
 Examples:
 
@@ -163,6 +179,10 @@ while [[ $# -gt 0 ]]; do
             SSL_ENABLED=true
             shift
             ;;
+        --pgvector)
+            PGVECTOR_ENABLED=true
+            shift
+            ;;
         --ssl-cert)
             require_arg "$@"
             SSL_CERT="$2"
@@ -178,6 +198,10 @@ while [[ $# -gt 0 ]]; do
             SSL_CA="$2"
             shift 2
             ;;
+        --client-cert-auth)
+            CLIENT_CERT_AUTH=true
+            shift
+            ;;
         -h|--help)
             usage
             ;;
@@ -191,6 +215,14 @@ done
 if [[ -z "${PASSWORD:-}" ]]; then
     echo "error: password is required; supply it with -p" >&2
     usage
+fi
+
+if [[ -z "$IMAGE" ]]; then
+    if [[ "$PGVECTOR_ENABLED" == "true" ]]; then
+        IMAGE="$PGVECTOR_IMAGE"
+    else
+        IMAGE="$DEFAULT_IMAGE"
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -224,6 +256,16 @@ if [[ "$SSL_ENABLED" == "true" ]]; then
     fi
 fi
 
+if [[ "$CLIENT_CERT_AUTH" == "true" && "$SSL_ENABLED" != "true" ]]; then
+    echo "error: --client-cert-auth requires --ssl" >&2
+    exit 1
+fi
+
+if [[ "$CLIENT_CERT_AUTH" == "true" && -n "$SSL_CERT" ]]; then
+    echo "error: --client-cert-auth requires generated certificates" >&2
+    exit 1
+fi
+
 # ---------------------------------------------------------------------------
 # Namespace
 # ---------------------------------------------------------------------------
@@ -232,6 +274,14 @@ kubectl create namespace "$NAMESPACE" \
     --dry-run=client \
     -o yaml |
     kubectl apply -f - >/dev/null
+
+# Use OpenShift's namespace-assigned base UID when available; fall back to a
+# non-root UID on non-OpenShift clusters where kubelet needs a numeric UID to
+# verify runAsNonRoot.
+RUN_AS_USER=$(kubectl get namespace "$NAMESPACE" \
+    -o jsonpath='{.metadata.annotations.openshift\.io/sa\.scc\.uid-range}' 2>/dev/null \
+    | cut -d/ -f1)
+: "${RUN_AS_USER:=1001}"
 
 # ---------------------------------------------------------------------------
 # Chart version
@@ -265,6 +315,30 @@ kubectl create secret generic "${RELEASE}-auth" \
     --dry-run=client \
     -o yaml |
     kubectl apply -f - >/dev/null
+
+# ---------------------------------------------------------------------------
+# pgvector
+#
+# Scripts in /docker-entrypoint-initdb.d run when the data directory is
+# initialized (every pod start, since it is an emptyDir) as POSTGRES_USER
+# against POSTGRES_DB. pgvector is not a trusted extension, so it must be
+# created by this superuser. If the image lacks pgvector, initialization fails
+# and the rollout below reports the error.
+# ---------------------------------------------------------------------------
+
+if [[ "$PGVECTOR_ENABLED" == "true" ]]; then
+    kubectl create configmap "${RELEASE}-initdb" \
+        -n "$NAMESPACE" \
+        --from-literal=01-pgvector.sql="CREATE EXTENSION IF NOT EXISTS vector;" \
+        --dry-run=client \
+        -o yaml |
+        kubectl apply -f - >/dev/null
+else
+    # Drop the ConfigMap left by a previous --pgvector install of this release.
+    kubectl delete configmap "${RELEASE}-initdb" \
+        -n "$NAMESPACE" \
+        --ignore-not-found >/dev/null
+fi
 
 # ---------------------------------------------------------------------------
 # SSL/TLS
@@ -329,6 +403,33 @@ EOF
             -extfile "$SAN_FILE" \
             2>/dev/null
 
+        if [[ "$CLIENT_CERT_AUTH" == "true" ]]; then
+            openssl req \
+                -new \
+                -nodes \
+                -newkey rsa:2048 \
+                -keyout "$CERT_TMPDIR/client.key" \
+                -out "$CERT_TMPDIR/client.csr" \
+                -subj "/CN=${USERNAME}" \
+                2>/dev/null
+
+            CLIENT_EXT_FILE="$CERT_TMPDIR/client.ext"
+            cat > "$CLIENT_EXT_FILE" <<EOF
+extendedKeyUsage=clientAuth
+EOF
+
+            openssl x509 \
+                -req \
+                -in "$CERT_TMPDIR/client.csr" \
+                -CA "$CERT_TMPDIR/ca.crt" \
+                -CAkey "$CERT_TMPDIR/ca.key" \
+                -CAcreateserial \
+                -out "$CERT_TMPDIR/client.crt" \
+                -days 365 \
+                -extfile "$CLIENT_EXT_FILE" \
+                2>/dev/null
+        fi
+
         SSL_CERT="$CERT_TMPDIR/server.crt"
         SSL_KEY="$CERT_TMPDIR/server.key"
         SSL_CA="$CERT_TMPDIR/ca.crt"
@@ -373,6 +474,18 @@ EOF
 
     echo "SSL certificates stored in secret '${RELEASE}-tls'"
 
+    if [[ "$CLIENT_CERT_AUTH" == "true" ]]; then
+        kubectl create secret generic "${RELEASE}-client-tls" \
+            -n "$NAMESPACE" \
+            --from-file=client.crt="$CERT_TMPDIR/client.crt" \
+            --from-file=client.key="$CERT_TMPDIR/client.key" \
+            --dry-run=client \
+            -o yaml |
+            kubectl apply -f - >/dev/null
+
+        echo "Client certificate stored in secret '${RELEASE}-client-tls'"
+    fi
+
     # -----------------------------------------------------------------------
     # PostgreSQL pg_hba.conf
     #
@@ -386,14 +499,20 @@ EOF
     # initialization using the local Unix socket.
     # -----------------------------------------------------------------------
 
+    if [[ "$CLIENT_CERT_AUTH" == "true" ]]; then
+        PG_HBA_AUTH="cert"
+    else
+        PG_HBA_AUTH="scram-sha-256"
+    fi
+
     kubectl create configmap "${RELEASE}-pg-hba" \
         -n "$NAMESPACE" \
         --from-literal=pg_hba.conf="\
 local all all trust
 hostnossl all all 0.0.0.0/0 reject
 hostnossl all all ::/0 reject
-hostssl all all 0.0.0.0/0 scram-sha-256
-hostssl all all ::/0 scram-sha-256
+hostssl all all 0.0.0.0/0 ${PG_HBA_AUTH}
+hostssl all all ::/0 ${PG_HBA_AUTH}
 " \
         --dry-run=client \
         -o yaml |
@@ -405,6 +524,12 @@ fi
 # ---------------------------------------------------------------------------
 # Generate Kubernetes manifests
 # ---------------------------------------------------------------------------
+
+PG_SSL_CA_ARGS=""
+if [[ "$SSL_ENABLED" == "true" && "$HAS_CA" == "true" ]]; then
+    PG_SSL_CA_ARGS="            - -c
+            - ssl_ca_file=/etc/tls/certs/ca.crt"
+fi
 
 generate_manifest() {
 
@@ -444,10 +569,24 @@ spec:
         app.kubernetes.io/name: postgresql
         app.kubernetes.io/instance: ${RELEASE}
     spec:
+      # OpenShift namespaces enforce the PodSecurity "restricted" profile, which
+      # rejects pods that do not set an explicit securityContext.
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
       initContainers:
         - name: init-pgdata
           image: ${IMAGE}
           imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            runAsNonRoot: true
+            runAsUser: ${RUN_AS_USER}
+            seccompProfile:
+              type: RuntimeDefault
           command:
             - sh
             - -c
@@ -466,6 +605,14 @@ EOF
         - name: init-tls
           image: ${IMAGE}
           imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            runAsNonRoot: true
+            runAsUser: ${RUN_AS_USER}
+            seccompProfile:
+              type: RuntimeDefault
           command:
             - sh
             - -c
@@ -502,6 +649,14 @@ EOF
         - name: postgresql
           image: ${IMAGE}
           imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            runAsNonRoot: true
+            runAsUser: ${RUN_AS_USER}
+            seccompProfile:
+              type: RuntimeDefault
 EOF
 
     if [[ "$SSL_ENABLED" == "true" ]]; then
@@ -514,6 +669,7 @@ EOF
             - ssl_cert_file=/etc/tls/certs/server.crt
             - -c
             - ssl_key_file=/etc/tls/certs/server.key
+${PG_SSL_CA_ARGS}
             - -c
             - hba_file=/etc/postgresql/pg_hba.conf
 EOF
@@ -564,6 +720,14 @@ EOF
               mountPath: /var/lib/postgresql/data
 EOF
 
+    if [[ "$PGVECTOR_ENABLED" == "true" ]]; then
+        cat <<EOF
+            - name: initdb
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+EOF
+    fi
+
     if [[ "$SSL_ENABLED" == "true" ]]; then
         cat <<EOF
             - name: tls-certs
@@ -582,6 +746,14 @@ EOF
         - name: pgdata
           emptyDir: {}
 EOF
+
+    if [[ "$PGVECTOR_ENABLED" == "true" ]]; then
+        cat <<EOF
+        - name: initdb
+          configMap:
+            name: ${RELEASE}-initdb
+EOF
+    fi
 
     if [[ "$SSL_ENABLED" == "true" ]]; then
         cat <<EOF
@@ -654,6 +826,8 @@ echo "  host:      ${HOST}:5432"
 echo "  database:  ${DATABASE}"
 echo "  user:      ${USERNAME}"
 echo "  ssl:       ${SSL_ENABLED}"
+echo "  image:     ${IMAGE}"
+echo "  pgvector:  ${PGVECTOR_ENABLED}"
 
 if [[ "$SSL_ENABLED" == "true" ]]; then
     echo ""

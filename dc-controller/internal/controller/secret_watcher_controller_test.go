@@ -74,6 +74,7 @@ var _ = Describe("Secret Watcher Controller", func() {
 				},
 				Annotations: map[string]string{
 					annotationDisplayName:       "My S3 Connection",
+					annotationDescription:       "Team S3 bucket",
 					annotationConnectionTypeRef: "s3",
 				},
 			},
@@ -128,6 +129,7 @@ var _ = Describe("Secret Watcher Controller", func() {
 		Expect(captured.Format).To(Equal("tabular"))
 		Expect(captured.CredentialsRef).NotTo(BeNil())
 		Expect(captured.CredentialsRef.Secret).To(Equal(secretName))
+		Expect(captured.Description).To(HaveValue(Equal("Team S3 bucket")))
 
 		Expect(k8sClient.Get(ctx, secretKey, secret)).To(Succeed())
 		Expect(secret.Annotations[annotationDCHSynced]).To(Equal(valueSyncedTrue))
@@ -151,6 +153,30 @@ var _ = Describe("Secret Watcher Controller", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(captured.Name).To(Equal(secretName))
 	})
+
+	DescribeTable("should omit description when annotation is absent or empty",
+		func(mutate func(*corev1.Secret)) {
+			secret := newSecret()
+			mutate(secret)
+			Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+
+			var captured Connection
+			mock := &mockMigrationClient{
+				createFn: func(_ context.Context, _ string, conn Connection) error {
+					captured = conn
+					return nil
+				},
+			}
+			r := reconciler(mock)
+
+			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: secretKey})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(mock.createCalls).To(Equal(1))
+			Expect(captured.Description).To(BeNil())
+		},
+		Entry("absent", func(s *corev1.Secret) { delete(s.Annotations, annotationDescription) }),
+		Entry("empty", func(s *corev1.Secret) { s.Annotations[annotationDescription] = "" }),
+	)
 
 	It("should skip already-synced Secret", func() {
 		secret := newSecret()
@@ -260,6 +286,47 @@ var _ = Describe("Secret Watcher Controller", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(mock.createCalls).To(Equal(1))
 	})
+
+	DescribeTable("should resolve builtin provider alias for connection type",
+		func(typeRef, wantID string) {
+			secret := newSecret()
+			secret.Annotations[annotationConnectionTypeRef] = typeRef
+			Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+
+			var captured Connection
+			mock := &mockMigrationClient{
+				listFn: func(_ context.Context, _ string) ([]ConnectionTypeResource, error) {
+					return []ConnectionTypeResource{
+						{
+							Metadata: ResourceMetadata{ID: "s3-uuid"},
+							Resource: ConnectionType{Name: "S3", Provider: "s3"},
+						},
+						{
+							Metadata: ResourceMetadata{ID: "oci-uuid"},
+							Resource: ConnectionType{Name: "OCI", Provider: "oci"},
+						},
+						{
+							Metadata: ResourceMetadata{ID: "uri-uuid"},
+							Resource: ConnectionType{Name: "URI", Provider: "uri"},
+						},
+					}, nil
+				},
+				createFn: func(_ context.Context, _ string, conn Connection) error {
+					captured = conn
+					return nil
+				},
+			}
+			r := reconciler(mock)
+
+			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: secretKey})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(mock.createCalls).To(Equal(1))
+			Expect(captured.DataConnectionTypeID).To(Equal(wantID))
+		},
+		Entry("s3", cmNameS3, "s3-uuid"),
+		Entry("oci-v1", cmNameOCIv1, "oci-uuid"),
+		Entry("uri-v1", cmNameURIv1, "uri-uuid"),
+	)
 
 	It("should not set synced on unexpected REST failure", func() {
 		secret := newSecret()
